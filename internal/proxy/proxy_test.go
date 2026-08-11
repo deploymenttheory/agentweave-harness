@@ -260,6 +260,45 @@ func TestClientResponsesToServerRequestsPassThrough(t *testing.T) {
 	}
 }
 
+// refuseTools is an Interceptor that refuses any tools/call with a canned
+// frame and forwards everything else.
+type refuseTools struct{ refusal string }
+
+func (r refuseTools) Intercept(raw []byte) []byte {
+	if strings.Contains(string(raw), `"tools/call"`) {
+		return []byte(r.refusal + "\n")
+	}
+	return nil
+}
+
+// TestInterceptorRefusalReplacesTheRequest pins the enforcement seam at the
+// pump: a refused request is answered to the client and never reaches the
+// server, while an allowed request flows through to the server as normal.
+func TestInterceptorRefusalReplacesTheRequest(t *testing.T) {
+	r := startRig(t, NopObserver{})
+	r.proxy.SetInterceptor(refuseTools{refusal: `{"jsonrpc":"2.0","id":"c1","result":{"isError":true}}`})
+
+	// A tools/call: refused. The client gets the refusal; the server sees nothing.
+	if _, err := io.WriteString(r.clientToProxy,
+		`{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Shell"}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	out := r.waitFor(t, r.proxyToClient, `"isError":true`)
+	if !strings.Contains(out, `"c1"`) {
+		t.Fatalf("refusal not returned to client: %q", out)
+	}
+
+	// An allowed request (tools/list): forwarded to the server.
+	if _, err := io.WriteString(r.clientToProxy,
+		`{"jsonrpc":"2.0","id":"c2","method":"tools/list"}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	inbox := r.waitFor(t, r.serverInbox, "tools/list")
+	if strings.Contains(inbox, "tools/call") {
+		t.Fatalf("refused request leaked to the server: %q", inbox)
+	}
+}
+
 // TestClientEOFEndsTheRunCleanly pins the shutdown shape: the MCP host
 // closing stdin is the normal end of a session, not an error.
 func TestClientEOFEndsTheRunCleanly(t *testing.T) {
