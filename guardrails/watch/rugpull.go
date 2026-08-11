@@ -351,3 +351,27 @@ func (r *RugPull) DiscoverMiddleware() mcp.Middleware {
 func (r *RugPull) Recheck(tools []*mcp.Tool) error {
 	return r.compare(HashTools(tools), "monitor")
 }
+
+// RecheckPrompts, RecheckResources and RecheckDiscover are the prompt, resource
+// and discover analogues of Recheck. In-process the SDK middleware compares
+// these surfaces on the live response; a proxy that observes the wire has no
+// SDK handler to wrap, so it fingerprints the parsed frame and compares here —
+// through the same trip-once-per-surface, audit-on-drift path. source names
+// where the fingerprint came from (e.g. "wire", "monitor") for the record.
+func (r *RugPull) RecheckPrompts(prompts []*mcp.Prompt, source string) error {
+	return r.comparePrompts(HashPrompts(prompts), source)
+}
+
+func (r *RugPull) RecheckResources(resources []*mcp.Resource, source string) error {
+	return r.compareResources(HashResources(resources), source)
+}
+
+func (r *RugPull) RecheckDiscover(caps *mcp.ServerCapabilities, instructions, source string) error {
+	return r.compareDiscover(HashDiscover(caps, instructions), source)
+}
+
+// RecheckTools is Recheck with an explicit source label, for a wire observer
+// that distinguishes the inline response from an out-of-band re-list.
+func (r *RugPull) RecheckTools(tools []*mcp.Tool, source string) error {
+	return r.compare(HashTools(tools), source)
+}

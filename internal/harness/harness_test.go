@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,12 @@ func fakeServerServant() {
 // the client-side hooks. t.Setenv makes the mode visible to the child via
 // the inherited environment.
 func runHarness(t *testing.T, mode string) (io.WriteCloser, *lockedBuffer, chan error) {
+	return runHarnessCfg(t, mode, Config{})
+}
+
+// runHarnessCfg is runHarness with caller-supplied Config overrides (Argv,
+// Logger and the client streams are always set here).
+func runHarnessCfg(t *testing.T, mode string, cfg Config) (io.WriteCloser, *lockedBuffer, chan error) {
 	t.Helper()
 	t.Setenv("AW_FAKE_SERVER", mode)
 	exe, err := os.Executable()
@@ -91,17 +98,44 @@ func runHarness(t *testing.T, mode string) (io.WriteCloser, *lockedBuffer, chan 
 	}
 	inR, inW := io.Pipe()
 	out := &lockedBuffer{}
+	cfg.Argv = []string{exe}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
+	cfg.ClientIn = inR
+	cfg.ClientOut = out
 	done := make(chan error, 1)
-	go func() {
-		done <- Run(context.Background(), Config{
-			Argv:      []string{exe},
-			Logger:    slog.New(slog.DiscardHandler),
-			ClientIn:  inR,
-			ClientOut: out,
-		})
-	}()
+	go func() { done <- Run(context.Background(), cfg) }()
 	t.Cleanup(func() { _ = inW.Close() })
 	return inW, out, done
+}
+
+// TestRunAuditsProxiedToolCalls covers the observe layer end to end: a real
+// child process, a tools/call over the proxy, and the harness's own audit
+// chain (written to a temp file) carrying a tool.call record — with no raw
+// argument value in it.
+func TestRunAuditsProxiedToolCalls(t *testing.T) {
+	auditFile := filepath.Join(t.TempDir(), "audit.jsonl")
+	in, out, done := runHarnessCfg(t, "echo", Config{AuditSink: auditFile})
+
+	call := `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Type","arguments":{"text":"topsecret"}}}`
+	if _, err := io.WriteString(in, call+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitContains(t, out, `"echo":true`)
+	drainClean(t, in, done)
+
+	b, err := os.ReadFile(auditFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := string(b)
+	if !strings.Contains(chain, `"event":"tool.call"`) {
+		t.Fatalf("audit chain has no tool.call:\n%s", chain)
+	}
+	if strings.Contains(chain, "topsecret") {
+		t.Fatalf("raw argument value leaked into the audit chain:\n%s", chain)
+	}
 }
 
 type lockedBuffer struct {
