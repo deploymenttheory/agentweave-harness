@@ -33,21 +33,35 @@ func main() {
 		SilenceUsage: true,
 	}
 
-	root.AddCommand(&cobra.Command{
-		Use:   "run -- <server> [args...]",
+	runCmd := &cobra.Command{
+		Use:   "run [flags] -- <server> [args...]",
 		Short: "Spawn a governed MCP server and proxy its stdio MCP transport",
 		Long: "run spawns the given server command as a child, places itself on the\n" +
 			"stdio MCP path between the MCP client and the server, and hosts the\n" +
-			"control channel the server's servant mode dials. In this release the\n" +
-			"harness proxies and observes; enforcement modes arrive with the policy\n" +
-			"engine wiring.",
+			"control channel the server's servant mode dials. It records the proxied\n" +
+			"conversation into a hash-chained audit log and fingerprints the server's\n" +
+			"advertised manifest for rug-pull drift. In this release the harness\n" +
+			"proxies and observes; enforcement modes arrive with the policy engine\n" +
+			"wiring.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// All diagnostics to stderr: stdout IS the proxied MCP stream.
 			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-			return harness.Run(cmd.Context(), harness.Config{Argv: args, Logger: logger})
+			sink, _ := cmd.Flags().GetString("audit-sink")
+			drift, _ := cmd.Flags().GetDuration("drift-interval")
+			return harness.Run(cmd.Context(), harness.Config{
+				Argv:          args,
+				Logger:        logger,
+				AuditSink:     sink,
+				DriftInterval: drift,
+			})
 		},
-	})
+	}
+	runCmd.Flags().String("audit-sink", "stderr",
+		`where to write the audit chain: "stderr", a directory (sealed per-session file), or a file path`)
+	runCmd.Flags().Duration("drift-interval", 0,
+		"how often to re-list the manifest out of band to catch a rug pull (0 disables)")
+	root.AddCommand(runCmd)
 
 	root.AddCommand(&cobra.Command{
 		Use:   "version",

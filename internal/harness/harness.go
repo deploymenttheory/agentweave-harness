@@ -1,14 +1,16 @@
 // Package harness orchestrates one governed session: it hosts the control
 // channel, spawns the governed server as a child with the bootstrap
-// environment, pumps the MCP stdio streams through the proxy, and supervises
-// the pieces until the session ends.
+// environment, pumps the MCP stdio streams through the proxy, records and
+// fingerprints the conversation through the observer, and supervises the
+// pieces until the session ends.
 //
-// Phase 2 scope: the harness is a transparent observer. It proxies
-// byte-faithfully, accepts a servant connection if the child dials one (a
-// Phase-3 server), acks it in observe mode, and tolerates a child that never
-// dials at all (a pre-Phase-3 server) — logging that fact rather than
-// failing, because a proxy that cannot wrap today's shipped server would
-// never be adopted. Enforcement arrives with Phase 4.
+// Current scope: the harness observes but does not yet refuse. It proxies
+// byte-faithfully; records the decidable methods into a hash-chained audit
+// log and fingerprints the advertised manifest for rug-pull drift (via
+// internal/observe); accepts a servant connection if the child dials one and
+// acks it in observe mode; and tolerates a child that never dials at all,
+// because a proxy that cannot wrap today's shipped server would never be
+// adopted. Verdicts and refusals wire onto this same observe seam next.
 package harness
 
 import (
@@ -19,8 +21,12 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"time"
 
+	"github.com/deploymenttheory/agentweave-harness/guardrails/audit"
+	"github.com/deploymenttheory/agentweave-harness/guardrails/watch"
 	"github.com/deploymenttheory/agentweave-harness/internal/control"
+	"github.com/deploymenttheory/agentweave-harness/internal/observe"
 	"github.com/deploymenttheory/agentweave-harness/internal/proxy"
 	"github.com/deploymenttheory/agentweave-harness/wire"
 )
@@ -37,6 +43,17 @@ type Config struct {
 	// own stdin/stdout.
 	ClientIn  io.Reader
 	ClientOut io.Writer
+
+	// AuditSink is where the harness audit chain is written: "" or "stderr"
+	// for the stderr stream (AUDIT {json} lines), a directory for a sealed
+	// per-session file, or a plain path for an appended JSONL file.
+	AuditSink string
+	// SessionStamp identifies this session in the audit chain and control
+	// channel. Empty lets the caller default it.
+	SessionStamp string
+	// DriftInterval is how often the harness re-lists the manifest out of band
+	// to catch a rug pull between client re-lists. Zero disables it.
+	DriftInterval time.Duration
 }
 
 // ErrNoArgv reports a Run with no server command line.
@@ -125,7 +142,33 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	p := proxy.New(clientIn, clientOut, serverIn, serverOut, logObserver{logger})
+	// The observer records the proxied conversation into a hash-chained audit
+	// log and fingerprints the advertised manifest for rug-pull drift. This is
+	// the observe half of moving adjudication out of the server; it records and
+	// detects but refuses nothing (mode is still observe).
+	stamp := cfg.SessionStamp
+	if stamp == "" {
+		stamp = "harness"
+	}
+	auditDest, err := audit.OpenDestination(cfg.AuditSink, stamp)
+	if err != nil {
+		return fmt.Errorf("harness: audit destination: %w", err)
+	}
+	auditLog := audit.NewAuditLog(auditDest)
+	defer func() { _ = auditLog.Close() }()
+	// A drift detected while observing is recorded and logged, not acted on:
+	// containment is the enforcing half, wired on this same detector later.
+	rp := watch.NewRugPull(func(reason string) {
+		logger.Warn("rug-pull drift observed (report-only)", "reason", reason)
+	}, auditLog)
+	obs := observe.New(auditLog, rp, logger)
+
+	_, _ = auditLog.Append("harness.session.started", map[string]any{"argv0": cfg.Argv[0]})
+
+	p := proxy.New(clientIn, clientOut, serverIn, serverOut, obs)
+	if cfg.DriftInterval > 0 {
+		go driftMonitor(ctx, p, obs, logger, cfg.DriftInterval)
+	}
 	pumpDone := make(chan error, 1)
 	go func() { pumpDone <- p.Run(ctx) }()
 
@@ -149,6 +192,38 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+// driftMonitor re-lists the manifest surfaces out of band on an interval,
+// feeding each response through the observer's fingerprint path. Injected
+// requests and their responses never reach the client (proxy.Inject consumes
+// them), so this is invisible to the session it is watching. Errors are
+// expected before the client has initialized the server and are ignored.
+func driftMonitor(
+	ctx context.Context,
+	p *proxy.Proxy,
+	obs *observe.Observer,
+	logger *slog.Logger,
+	interval time.Duration,
+) {
+	surfaces := []string{"tools/list", "prompts/list", "resources/list"}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for _, method := range surfaces {
+				resp, err := p.Inject(ctx, map[string]any{"jsonrpc": "2.0", "method": method})
+				if err != nil {
+					logger.Debug("harness: drift re-list failed", "method", method, "err", err)
+					continue
+				}
+				obs.FingerprintInjected(method, resp)
+			}
+		}
+	}
+}
+
 // servantHandlers is the Phase-2 control vocabulary: everything is accepted
 // and logged, nothing is acted on yet. The handlers grow with the phases.
 func servantHandlers(logger *slog.Logger) map[string]control.Handler {
@@ -166,16 +241,4 @@ func servantHandlers(logger *slog.Logger) map[string]control.Handler {
 		wire.TypeAuditAnchor:     logged,
 		wire.TypePlanEvaluate:    logged,
 	}
-}
-
-// logObserver is the Phase-2 stand-in for the audit/rug-pull observer: it
-// counts frames at debug level and never touches them.
-type logObserver struct{ logger *slog.Logger }
-
-func (o logObserver) OnClientFrame(raw []byte) {
-	o.logger.Debug("harness: client frame", "bytes", len(raw))
-}
-
-func (o logObserver) OnServerFrame(raw []byte) {
-	o.logger.Debug("harness: server frame", "bytes", len(raw))
 }

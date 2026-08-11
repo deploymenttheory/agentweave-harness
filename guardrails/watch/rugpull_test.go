@@ -13,6 +13,45 @@ import (
 
 func tool(name, desc string) *mcp.Tool { return &mcp.Tool{Name: name, Description: desc} }
 
+// TestWireRecheckMethodsTripOnDrift covers the public recheck entry points a
+// wire observer uses: after a baseline is pinned, an unchanged manifest is
+// silent and a mutated one trips exactly once, on each of the four surfaces.
+func TestWireRecheckMethodsTripOnDrift(t *testing.T) {
+	var trips atomic.Int32
+	rp := NewRugPull(func(string) { trips.Add(1) }, nil)
+
+	// Tools.
+	rp.SetBaseline([]*mcp.Tool{tool("A", "d")})
+	if err := rp.RecheckTools([]*mcp.Tool{tool("A", "d")}, "wire"); err != nil {
+		t.Fatalf("identical tools tripped: %v", err)
+	}
+	if err := rp.RecheckTools([]*mcp.Tool{tool("A", "d"), tool("Evil", "x")}, "wire"); err == nil {
+		t.Fatal("tool drift not detected")
+	}
+
+	// Prompts.
+	rp.SetPromptBaseline([]*mcp.Prompt{{Name: "P"}})
+	if err := rp.RecheckPrompts([]*mcp.Prompt{{Name: "P2"}}, "wire"); err == nil {
+		t.Fatal("prompt drift not detected")
+	}
+
+	// Resources.
+	rp.SetResourceBaseline([]*mcp.Resource{{URI: "u1"}})
+	if err := rp.RecheckResources([]*mcp.Resource{{URI: "u2"}}, "wire"); err == nil {
+		t.Fatal("resource drift not detected")
+	}
+
+	// Discover.
+	rp.SetDiscoverBaseline(&mcp.ServerCapabilities{}, "hello")
+	if err := rp.RecheckDiscover(&mcp.ServerCapabilities{}, "changed", "wire"); err == nil {
+		t.Fatal("discover drift not detected")
+	}
+
+	if trips.Load() != 4 {
+		t.Fatalf("want 4 trips (one per surface), got %d", trips.Load())
+	}
+}
+
 func TestHashToolsOrderIndependent(t *testing.T) {
 	a := []*mcp.Tool{tool("Snapshot", "x"), tool("Click", "y"), tool("Kill", "z")}
 	b := []*mcp.Tool{tool("Kill", "z"), tool("Snapshot", "x"), tool("Click", "y")}

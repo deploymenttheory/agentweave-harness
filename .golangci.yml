@@ -107,6 +107,13 @@ linters:
         linters:
           - tagliatelle
 
+      # The observer unmarshals MCP protocol result frames, whose fields are
+      # camelCase by the spec (nextCursor). These are the wire's names, not
+      # ours, so tagliatelle's snake_case rule does not apply.
+      - path: internal/observe/observe\.go
+        linters:
+          - tagliatelle
+
       # THE EXTRACTION-DEBT REGISTER. The guardrails packages arrived from
       # windows-mcp-server verbatim in Phase 1, carrying ~61 issues that repo
       # also gates around (its .golangci.yml documents the backlog). Fixing
