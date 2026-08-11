@@ -1,0 +1,8 @@
+# Build artifacts
+*.exe
+*.test
+*.out
+agentweave-harness
+
+# Lint reports
+golangci-lint-report.sarif

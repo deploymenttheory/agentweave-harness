@@ -1,0 +1,67 @@
+name: go | Build & Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/go-build-test.yml'
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: '🧪 Build & Test (${{ matrix.os }})'
+    # Both platforms by design: the harness's decision logic (policy, audit,
+    # hostmatch, proxy, wire) is platform-agnostic and must stay runnable
+    # without a Windows host; the windows-tagged actuation files (contain,
+    # egress OS enforcement) only compile-and-test on the Windows leg. This
+    # preserves the "core builds on Linux" property the guardrails packages
+    # had in windows-mcp-server.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Check Out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: 'go.sum'
+          cache: true
+
+      - name: Verify modules and tidiness
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy -diff
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1 -v
+
+      # The (amd64 || arm64) build tag on the windows actuation files is
+      # asserted in-source and verified nowhere else; cross-compiling catches
+      # arm64-only breakage before release.
+      - name: Build (windows/arm64 cross-compile)
+        if: matrix.os == 'windows-latest'
+        env:
+          GOARCH: arm64
+        run: go build ./...
