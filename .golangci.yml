@@ -1,0 +1,123 @@
+version: "2"
+
+run:
+  timeout: 30m
+  # CI mode: fails if go.mod needs updates, ensuring dependencies are properly declared
+  modules-download-mode: readonly
+  allow-parallel-runners: true
+  allow-serial-runners: false
+  concurrency: 2
+
+issues:
+  # Report everything, everywhere. This repo starts lint-clean and stays that
+  # way — unlike windows-mcp-server there is no debt backlog to gate around, so
+  # no `new:`/merge-base filtering and whole files are always in scope.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+  new: false
+  whole-files: true
+
+  # Automatically apply any fixable issues (like gofmt/goimports).
+  fix: true
+
+linters:
+  default: none
+  enable:
+    # Core correctness & compile checks
+    - govet
+    - staticcheck
+    - errcheck
+    - unused
+    - ineffassign
+
+    # error-handling best practices
+    - errorlint
+    - err113
+
+    # Safety & resource handling
+    - bodyclose
+    - gosec
+
+    # Context discipline
+    - contextcheck
+    - noctx
+    - nilnil
+
+    # Quality & style
+    - gocritic
+    - prealloc
+    - misspell
+    - gocyclo
+    - wrapcheck
+
+    # Struct-tag discipline
+    - musttag
+    - tagliatelle
+
+  settings:
+    nakedret:
+      max-func-lines: 40
+
+    # The audit chain, wire envelopes and policy documents are snake_case JSON,
+    # matching the windows-mcp-server artifacts this repo's packages came from
+    # (and will keep verifying). tagliatelle defaults to camel, which would
+    # contradict that convention.
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+
+  exclusions:
+    generated: strict
+    warn-unused: true
+    presets:
+      - comments
+      - std-error-handling
+      - common-false-positives
+      - legacy
+    rules:
+      # in test files, silence these noisy checks
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - errcheck
+          - dupl
+          - gosec
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+    - gci
+    - golines
+
+  settings:
+    golines:
+      max-len: 120
+
+    gci:
+      sections:
+        - Standard
+        - Default
+        - Prefix(github.com/deploymenttheory)
+
+  exclusions:
+    warn-unused: false
+    generated: strict
+
+output:
+  formats:
+    text:
+      path: stderr
+      print-linter-name: true
+      print-issued-lines: true
+      colors: true
+
+  path-mode: ""
+
+  sort-order:
+    - severity
+    - file
+
+  show-stats: true
