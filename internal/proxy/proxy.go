@@ -58,22 +58,40 @@ type NopObserver struct{}
 func (NopObserver) OnClientFrame([]byte) {}
 func (NopObserver) OnServerFrame([]byte) {}
 
+// Interceptor can refuse a client→server request. For each client frame it
+// returns a non-nil response frame to refuse — that frame is written to the
+// client verbatim and the request is NOT forwarded to the server — or nil to
+// forward normally. This is the seam the policy engine sits on: the governed
+// server never sees a request the harness refuses.
+//
+// Intercept runs on the client→server pump goroutine, so it must not block
+// indefinitely; a policy decision that needs to wait (an approval, a signal
+// round-trip) is the caller's responsibility to bound.
+type Interceptor interface {
+	Intercept(raw []byte) []byte
+}
+
 // Proxy pumps frames between a client (stdin/stdout of the harness) and a
 // server (stdin/stdout of the child process).
 type Proxy struct {
-	clientIn  io.Reader // frames from the MCP client
-	clientOut io.Writer // frames to the MCP client
-	serverIn  io.Writer // frames to the governed server
-	serverOut io.Reader // frames from the governed server
-	obs       Observer
+	clientIn    io.Reader // frames from the MCP client
+	clientOut   io.Writer // frames to the MCP client
+	serverIn    io.Writer // frames to the governed server
+	serverOut   io.Reader // frames from the governed server
+	obs         Observer
+	interceptor Interceptor // nil = never refuse (pure proxy)
 
-	mu       sync.Mutex
-	nextID   uint64
-	pending  map[string]chan []byte // injected id → response sink
-	remapped map[string]json.RawMessage
-	writeMu  sync.Mutex // serializes serverIn writes (pump + Inject)
-	closed   bool
+	mu            sync.Mutex
+	nextID        uint64
+	pending       map[string]chan []byte // injected id → response sink
+	remapped      map[string]json.RawMessage
+	writeMu       sync.Mutex // serializes serverIn writes (pump + Inject)
+	clientWriteMu sync.Mutex // serializes clientOut writes (server pump + refusals)
+	closed        bool
 }
+
+// SetInterceptor installs the refusal seam. It must be called before Run.
+func (p *Proxy) SetInterceptor(i Interceptor) { p.interceptor = i }
 
 // New builds a proxy over the four streams. obs must not be nil; use
 // NopObserver.
@@ -173,14 +191,28 @@ func (p *Proxy) pumpClientToServer() error {
 		line, err := readLine(r)
 		if len(line) > 0 {
 			p.obs.OnClientFrame(line)
-			out, werr := p.forwardClientFrame(line)
-			if werr != nil {
-				return werr
+			// The refusal seam runs before forwarding: a refused request is
+			// answered to the client and never reaches the server. Observation
+			// still happened above, so a refused call is recorded like any other.
+			if p.interceptor != nil {
+				if refusal := p.interceptor.Intercept(line); refusal != nil {
+					if werr := p.writeClient(refusal); werr != nil {
+						return werr
+					}
+					goto next
+				}
 			}
-			if werr := p.writeServer(out); werr != nil {
-				return werr
+			{
+				out, werr := p.forwardClientFrame(line)
+				if werr != nil {
+					return werr
+				}
+				if werr := p.writeServer(out); werr != nil {
+					return werr
+				}
 			}
 		}
+	next:
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -188,6 +220,17 @@ func (p *Proxy) pumpClientToServer() error {
 			return err
 		}
 	}
+}
+
+// writeClient serializes writes to the client stream between the server→client
+// pump and synthesized refusals.
+func (p *Proxy) writeClient(line []byte) error {
+	p.clientWriteMu.Lock()
+	defer p.clientWriteMu.Unlock()
+	if _, err := p.clientOut.Write(line); err != nil {
+		return fmt.Errorf("proxy: write to client: %w", err)
+	}
+	return nil
 }
 
 // forwardClientFrame returns the bytes to send to the server: the original
@@ -232,8 +275,8 @@ func (p *Proxy) pumpServerToClient() error {
 			}
 			if forward {
 				p.obs.OnServerFrame(out)
-				if _, werr := p.clientOut.Write(out); werr != nil {
-					return fmt.Errorf("proxy: write to client: %w", werr)
+				if werr := p.writeClient(out); werr != nil {
+					return werr
 				}
 			}
 		}
