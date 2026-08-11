@@ -62,6 +62,15 @@ linters:
     nakedret:
       max-func-lines: 40
 
+    wrapcheck:
+      # Our own sibling packages already return well-prefixed errors
+      # ("wire: ...", "control: ..."), so requiring a caller in another
+      # package of this module to wrap them again adds noise, not context.
+      # wrapcheck treats any other package as "external" by default; tell it
+      # this module is not external.
+      ignore-package-globs:
+        - github.com/deploymenttheory/agentweave-harness/*
+
     # The audit chain, wire envelopes and policy documents are snake_case JSON,
     # matching the windows-mcp-server artifacts this repo's packages came from
     # (and will keep verifying). tagliatelle defaults to camel, which would
@@ -87,6 +96,7 @@ linters:
           - errcheck
           - dupl
           - gosec
+          - wrapcheck
 
       # Microsoft Graph response DTOs must mirror the API's camelCase field
       # names (deviceId, isCompliant, accountEnabled...). The project-wide
