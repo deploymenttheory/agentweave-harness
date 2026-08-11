@@ -11,9 +11,12 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/deploymenttheory/agentweave-harness/internal/harness"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -29,6 +32,22 @@ func main() {
 			"adjudicator. See docs/architecture.md.",
 		SilenceUsage: true,
 	}
+
+	root.AddCommand(&cobra.Command{
+		Use:   "run -- <server> [args...]",
+		Short: "Spawn a governed MCP server and proxy its stdio MCP transport",
+		Long: "run spawns the given server command as a child, places itself on the\n" +
+			"stdio MCP path between the MCP client and the server, and hosts the\n" +
+			"control channel the server's servant mode dials. In this release the\n" +
+			"harness proxies and observes; enforcement modes arrive with the policy\n" +
+			"engine wiring.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// All diagnostics to stderr: stdout IS the proxied MCP stream.
+			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+			return harness.Run(cmd.Context(), harness.Config{Argv: args, Logger: logger})
+		},
+	})
 
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
