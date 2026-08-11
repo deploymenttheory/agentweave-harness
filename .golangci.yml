@@ -9,12 +9,15 @@ run:
   concurrency: 2
 
 issues:
-  # Report everything, everywhere. This repo starts lint-clean and stays that
-  # way — unlike windows-mcp-server there is no debt backlog to gate around, so
-  # no `new:`/merge-base filtering and whole files are always in scope.
   max-issues-per-linter: 0
   max-same-issues: 0
   uniq-by-line: false
+
+  # Report everything, everywhere, deterministically — no merge-base gating.
+  # (Gating on "new vs main" cannot describe this repo: the Phase-1 extraction
+  # landed the guardrails tree in one PR, so its grandfathered issues would all
+  # have counted as new. The imported debt is instead registered explicitly in
+  # the exclusion rules below, where shrinking it is visible in diffs.)
   new: false
   whole-files: true
 
@@ -84,6 +87,36 @@ linters:
           - errcheck
           - dupl
           - gosec
+
+      # Microsoft Graph response DTOs must mirror the API's camelCase field
+      # names (deviceId, isCompliant, accountEnabled...). The project-wide
+      # snake_case rule is right for our own artifacts — the audit chain, the
+      # wire envelopes — but renaming these would break Graph deserialization
+      # outright. Ported from windows-mcp-server, which excludes the same file.
+      - path: graph\.go
+        linters:
+          - tagliatelle
+
+      # THE EXTRACTION-DEBT REGISTER. The guardrails packages arrived from
+      # windows-mcp-server verbatim in Phase 1, carrying ~61 issues that repo
+      # also gates around (its .golangci.yml documents the backlog). Fixing
+      # them during the extraction would have broken the phase's
+      # byte-identical discipline: wrapcheck/err113 fixes change error shapes,
+      # bodyclose fixes touch request paths. This rule is the register of that
+      # debt — pay it down by removing linters from this list (run
+      # `golangci-lint run` after deleting one to see what's left), never by
+      # adding to it. New packages (wire/, internal/, cmd/) get no exemption.
+      - path: ^guardrails/
+        linters:
+          - bodyclose
+          - err113
+          - gocritic
+          - gocyclo
+          - noctx
+          - prealloc
+          - staticcheck
+          - unused
+          - wrapcheck
 
 formatters:
   enable:

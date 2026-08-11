@@ -1,0 +1,52 @@
+name: go | Linter
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - '.github/workflows/go-lint.yml'
+      - '.golangci.yml'
+      - '**/*.go'
+
+permissions:
+  contents: read
+  pull-requests: write  # Needed for "only-new-issues" and commenting on PR
+  issues: write  # Needed for commenting on PR
+
+jobs:
+  golint:
+    name: '✨ Run golangci-lint'
+    # Windows runner: the contain/egress actuation files are windows-tagged and
+    # would be excluded from analysis entirely on Linux. The platform-agnostic
+    # majority analyzes identically on either.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check Out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0  # Full history for merge-base detection
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: 'go.sum'
+          cache: true
+          go-version: stable
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: latest
+          # No --issues-exit-code=0: lint gates the PR. Deterministic full run —
+          # .golangci.yml reports everything and registers the extraction debt
+          # explicitly, so there is no merge-base diffing here (only-new-issues
+          # would treat an initial-import PR's entire tree as "new").
+          args: --timeout=30m --verbose --config=./.golangci.yml
+          only-new-issues: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          skip-cache: false
+          skip-save-cache: false
+          cache-invalidation-interval: 7
