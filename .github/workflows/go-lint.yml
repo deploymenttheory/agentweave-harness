@@ -40,10 +40,12 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: latest
-          # No --issues-exit-code=0: lint gates the PR. Safe because .golangci.yml
-          # sets new: true with new-from-merge-base: main, so only new issues surface.
+          # No --issues-exit-code=0: lint gates the PR. Deterministic full run —
+          # .golangci.yml reports everything and registers the extraction debt
+          # explicitly, so there is no merge-base diffing here (only-new-issues
+          # would treat an initial-import PR's entire tree as "new").
           args: --timeout=30m --verbose --config=./.golangci.yml
-          only-new-issues: true
+          only-new-issues: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
           skip-cache: false
           skip-save-cache: false
