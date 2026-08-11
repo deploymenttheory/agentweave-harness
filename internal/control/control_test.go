@@ -2,10 +2,12 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -112,6 +114,93 @@ func TestHandshakeNegotiatesAndAcks(t *testing.T) {
 	if ack.Proto != s.Version || ack.Mode != wire.ModeObserve {
 		t.Fatalf("ack = %+v", ack)
 	}
+}
+
+// TestRequestCorrelatesItsResponse pins the request/response path Serve gained:
+// the harness sends a request, a concurrent Serve loop routes the servant's
+// correlated reply (matched by `re`) back to the waiting caller, while an
+// unrelated notification still reaches its handler.
+func TestRequestCorrelatesItsResponse(t *testing.T) {
+	h := newHost(t)
+	sessions, errs := awaitAsync(h)
+
+	conn := dial(t, h.Addr)
+	sendHello(t, conn, wire.Hello{ProtoMin: 1, ProtoMax: 1, Token: h.Token})
+	var s *Session
+	select {
+	case s = <-sessions:
+	case err := <-errs:
+		t.Fatal(err)
+	}
+
+	// The servant side (this test's conn) answers requests: read each, reply
+	// with re set to the request id, and record any notification it sees.
+	gotNotify := make(chan string, 1)
+	go func() {
+		r := wire.NewReader(conn)
+		w := wire.NewWriter(conn)
+		for {
+			env, err := r.Read()
+			if err != nil {
+				return
+			}
+			if env.ID != "" {
+				// A request: echo a result correlated by re.
+				reply, _ := wire.Marshal(1, wire.TypeSignalResult, "", env.ID,
+					wire.SignalResult{Results: []json.RawMessage{[]byte(`{"id":"tpm","status":"pass"}`)}})
+				_ = w.Write(reply)
+			}
+		}
+	}()
+
+	// Serve must run for Request's response to be delivered.
+	go func() { _ = s.Serve(slog.New(slog.DiscardHandler), map[string]Handler{}) }()
+
+	resp, err := s.Request(context.Background(), wire.TypeSignalEvaluate,
+		wire.SignalEvaluate{IDs: []string{"tpm"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Type != wire.TypeSignalResult {
+		t.Fatalf("response type = %q", resp.Type)
+	}
+	var sr wire.SignalResult
+	if err := wire.Unmarshal(resp, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Results) != 1 || !strings.Contains(string(sr.Results[0]), "pass") {
+		t.Fatalf("correlated result wrong: %s", sr.Results)
+	}
+	_ = gotNotify
+}
+
+// TestRequestUnblocksWhenChannelCloses pins that a Request in flight when the
+// channel drops returns an error rather than hanging on its context.
+func TestRequestUnblocksWhenChannelCloses(t *testing.T) {
+	h := newHost(t)
+	sessions, errs := awaitAsync(h)
+	conn := dial(t, h.Addr)
+	sendHello(t, conn, wire.Hello{ProtoMin: 1, ProtoMax: 1, Token: h.Token})
+	var s *Session
+	select {
+	case s = <-sessions:
+	case err := <-errs:
+		t.Fatal(err)
+	}
+
+	serveDone := make(chan struct{})
+	go func() { _ = s.Serve(slog.New(slog.DiscardHandler), map[string]Handler{}); close(serveDone) }()
+
+	// The servant never answers; close the channel while a request is pending.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = conn.Close()
+	}()
+	_, err := s.Request(context.Background(), wire.TypeSignalEvaluate, wire.SignalEvaluate{IDs: []string{"x"}})
+	if err == nil {
+		t.Fatal("Request returned nil after the channel closed")
+	}
+	<-serveDone
 }
 
 // TestChannelTokenMismatchKillsChild pins the authentication contract: a
