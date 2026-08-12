@@ -13,9 +13,11 @@
 // never sees it (via internal/enforce). An enforcing policy begins the session
 // fail-closed until the engine is ready. It accepts a servant connection if the
 // child dials one, and tolerates a child that never dials at all, because a
-// proxy that cannot wrap today's shipped server would never be adopted. What
-// remains is for the governed server to shed its now-redundant in-process
-// enforcement when the harness signals it is enforcing.
+// proxy that cannot wrap today's shipped server would never be adopted. The
+// hello.ack tells the servant which mode governs the session — `enforce` only
+// when the policy decider is actually installed, never from the policy document
+// alone — which is what licenses a governed server to shed its now-redundant
+// in-process enforcement on that signal.
 package harness
 
 import (
@@ -187,14 +189,25 @@ func Run(ctx context.Context, cfg Config) error {
 			"proto", sess.Version,
 			"signals", len(sess.Hello.Capabilities.Signals),
 			"elevated", sess.Hello.Capabilities.Elevated)
-		if err := sess.Ack(wire.HelloAck{Mode: wire.ModeObserve}); err != nil {
+		// Build enforcement before the ack, now that the signal source (the
+		// servant) is reachable. The ack's mode must be honest: `enforce` is
+		// what licenses the server to shed its own in-process enforcement, so
+		// it is sent only when the real decider actually got installed —
+		// deriving it from the policy document alone would, on a validation
+		// failure, leave the harness observe-only *and* the server shed, the
+		// one unguarded combination. The servant blocks reading the ack, so
+		// nothing races this ordering; Serve (which answers the engine's
+		// signal round-trips) starts right after.
+		activated := installEnforcement(p, sess, policyDoc, obs, auditLog, logger)
+		ackMode := wire.ModeObserve
+		if activated && policyDoc.Mode == policy.ModeEnforcing {
+			ackMode = wire.ModeEnforce
+		}
+		_, _ = auditLog.Append("harness.mode.acked", map[string]any{"mode": ackMode})
+		if err := sess.Ack(wire.HelloAck{Mode: ackMode}); err != nil {
 			logger.Error("harness: hello.ack failed", "err", err)
 			return
 		}
-		// Build enforcement now that the signal source (the servant) is reachable.
-		// Serve must run concurrently for the engine's signal round-trips to be
-		// answered, so it is started after the interceptor swap, below.
-		installEnforcement(p, sess, policyDoc, obs, auditLog, logger)
 		if err := sess.Serve(logger, servantHandlers(logger)); err != nil {
 			logger.Error("harness: control channel failed", "err", err)
 		}

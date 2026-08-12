@@ -57,6 +57,7 @@ func fakeSignalServant() {
 	if err != nil || ack.Type != wire.TypeHelloAck {
 		os.Exit(4)
 	}
+	reportAckMode(ack)
 	// Answer control requests: a signal.evaluate gets a failing result per id.
 	go func() {
 		for {
@@ -79,6 +80,28 @@ func fakeSignalServant() {
 		}
 	}()
 	fakeServerEcho()
+}
+
+// ackModeFileEnv names a file the fake servant writes the hello.ack's mode
+// into, so a test can assert which mode the harness actually told its server —
+// the wire fact the shedding contract rests on — without touching the MCP
+// stream.
+const ackModeFileEnv = "AW_ACK_MODE_FILE"
+
+// reportAckMode writes the ack's mode to the file named by ackModeFileEnv, if
+// the driving test asked for it.
+func reportAckMode(ack wire.Envelope) {
+	path := os.Getenv(ackModeFileEnv)
+	if path == "" {
+		return
+	}
+	var ha wire.HelloAck
+	if err := wire.Unmarshal(ack, &ha); err != nil {
+		os.Exit(5)
+	}
+	if err := os.WriteFile(path, []byte(ha.Mode), 0o600); err != nil {
+		os.Exit(5)
+	}
 }
 
 // fakeServerEcho is a pre-Phase-3 server: speaks MCP-ish stdio only, never
@@ -205,6 +228,8 @@ func TestRunEnforcesPolicyOverTheChannel(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	ackFile := filepath.Join(t.TempDir(), "ackmode")
+	t.Setenv(ackModeFileEnv, ackFile)
 	in, out, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
 
 	// Give the servant a moment to connect and enforcement to activate, so the
@@ -224,7 +249,83 @@ func TestRunEnforcesPolicyOverTheChannel(t *testing.T) {
 	if strings.Contains(got, `"echo":true`) {
 		t.Fatalf("refused call reached the server (saw echo):\n%s", got)
 	}
+	// The enforcement the client just observed must also have been announced to
+	// the server: this session's ack is the license to shed.
+	if mode := waitAckMode(t, ackFile); mode != wire.ModeEnforce {
+		t.Fatalf("harness enforced on the wire but acked mode %q", mode)
+	}
 	drainClean(t, in, done)
+}
+
+// TestAckIsEnforceOnlyWhenDeciderInstalled pins the honest-ack invariant: the
+// hello.ack says `enforce` exactly when the harness installed a live policy
+// decider — not whenever the document asks for enforcement. An audit-mode
+// document refuses nothing, and a document naming a signal the servant cannot
+// evaluate never activates, so both must ack observe; the server keeps its
+// local stack in each case.
+func TestAckIsEnforceOnlyWhenDeciderInstalled(t *testing.T) {
+	cases := []struct {
+		name       string
+		policyMode string
+		signal     string // the id the policy requires; the servant serves "tpm"
+		want       string
+	}{
+		{"enforcing policy with servable signals", "enforce", "tpm", wire.ModeEnforce},
+		{"audit-mode policy never licenses shedding", "audit", "tpm", wire.ModeObserve},
+		{"unservable signal leaves the ack observe", "enforce", "bitlocker", wire.ModeObserve},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policyPath := filepath.Join(t.TempDir(), "policy.json")
+			policyDoc := `{
+			  "version": 1,
+			  "mode": "` + tc.policyMode + `",
+			  "signals": {"` + tc.signal + `": {"ttl": "0s"}},
+			  "rules": [
+			    {"name": "r", "match": {"tool": "Shell"}, "require": ["` + tc.signal + `"], "on_fail": "deny"}
+			  ]
+			}`
+			if err := os.WriteFile(policyPath, []byte(policyDoc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ackFile := filepath.Join(t.TempDir(), "ackmode")
+			t.Setenv(ackModeFileEnv, ackFile)
+			in, out, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
+
+			if mode := waitAckMode(t, ackFile); mode != tc.want {
+				t.Fatalf("acked mode %q, want %q", mode, tc.want)
+			}
+			// The unactivated-enforcing session must still be fail-closed: the
+			// DenyAll installed before the pump keeps refusing decidable calls,
+			// it just never licenses the server to shed.
+			if tc.policyMode == "enforce" && tc.want == wire.ModeObserve {
+				call := `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Shell","arguments":{}}}`
+				if _, err := io.WriteString(in, call+"\n"); err != nil {
+					t.Fatal(err)
+				}
+				got := waitContains(t, out, `"c1"`)
+				if !strings.Contains(got, `"isError":true`) {
+					t.Fatalf("fail-closed session answered a decidable call:\n%s", got)
+				}
+			}
+			drainClean(t, in, done)
+		})
+	}
+}
+
+// waitAckMode polls for the fake servant's record of the hello.ack mode. The
+// ack happens during session startup, concurrently with the test body.
+func waitAckMode(t *testing.T, path string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+			return string(b)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for the servant to record the acked mode")
+	return ""
 }
 
 type lockedBuffer struct {
@@ -288,7 +389,8 @@ func TestRunProxiesARealChildProcess(t *testing.T) {
 
 // TestRunAcceptsAServantAndStaysTransparent covers the Phase-3 handshake
 // path end to end over the real platform transport: the child dials,
-// authenticates, gets an observe-mode ack, and MCP traffic still flows.
+// authenticates, gets an observe-mode ack (no policy is configured, so no
+// decider is installed), and MCP traffic still flows.
 func TestRunAcceptsAServantAndStaysTransparent(t *testing.T) {
 	in, out, done := runHarness(t, "servant")
 
