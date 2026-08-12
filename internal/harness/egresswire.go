@@ -10,6 +10,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,9 +18,11 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/deploymenttheory/agentweave-harness/guardrails/audit"
 	"github.com/deploymenttheory/agentweave-harness/guardrails/egress"
 	"github.com/deploymenttheory/agentweave-harness/guardrails/hostmatch"
 	"github.com/deploymenttheory/agentweave-harness/guardrails/policy"
+	"github.com/deploymenttheory/agentweave-harness/internal/control"
 	"github.com/deploymenttheory/agentweave-harness/wire"
 )
 
@@ -149,4 +152,67 @@ func egressTierName(e policy.EgressPolicy) string {
 		return "block_all_outbound"
 	}
 	return "applications"
+}
+
+// egressNeedsActuation reports whether the composed egress policy asks for OS
+// firewall enforcement on the host. The proxy-only tier (an allowlist with no
+// applications and no global block) needs none: nothing is forced through the
+// proxy, so there is nothing for the host to firewall.
+func egressNeedsActuation(layers *sessionLayers) bool {
+	if layers.composed == nil {
+		return false
+	}
+	e := layers.composed.Config.Egress
+	return e.Enabled && (len(e.Applications) > 0 || e.BlockAllOutbound)
+}
+
+// pushEgressEnforcement asks the governed server to install the composed
+// egress policy's OS firewall enforcement, pointed at the harness proxy. The
+// server actuates and reports back; the harness records the outcome. A skip
+// (the server could not apply it) is logged, not fatal: the elevation gate at
+// the handshake already refused the unservable case, so a skip here is an
+// operational surprise to surface, not a posture the session must abandon.
+func pushEgressEnforcement(
+	ctx context.Context,
+	sess *control.Session,
+	layers *sessionLayers,
+	egressPort int,
+	auditLog *audit.AuditLog,
+	logger *slog.Logger,
+) {
+	e := layers.composed.Config.Egress
+	exe := ""
+	if x, err := os.Executable(); err == nil {
+		exe = x
+	}
+	params, err := json.Marshal(wire.EgressApplyParams{
+		ProxyPort:        egressPort,
+		ProxyExecutable:  exe,
+		Applications:     e.Applications,
+		BlockAllOutbound: e.BlockAllOutbound,
+		AllowPorts:       e.AllowPorts,
+		SetSystemProxy:   e.SetSystemProxy,
+	})
+	if err != nil {
+		logger.Error("harness: marshal egress_apply params", "err", err)
+		return
+	}
+	resp, err := sess.Request(ctx, wire.TypeActuate, wire.Actuate{Rung: wire.RungEgressApply, Params: params})
+	if err != nil {
+		logger.Error("harness: egress_apply actuation failed", "err", err)
+		_, _ = auditLog.Append("egress.actuate.failed", map[string]any{"reason": err.Error()})
+		return
+	}
+	var res wire.ActuateResult
+	if err := wire.Unmarshal(resp, &res); err != nil {
+		logger.Error("harness: undecodable egress_apply result", "err", err)
+		return
+	}
+	_, _ = auditLog.Append("egress.actuate.result", map[string]any{
+		"ok": res.OK, "tier": e.Enforcement(), "skipped_reason": res.SkippedReason,
+	})
+	if !res.OK {
+		logger.Warn("harness: server could not apply egress OS enforcement",
+			"tier", e.Enforcement(), "reason", res.SkippedReason)
+	}
 }
