@@ -4,13 +4,18 @@
 // fingerprints the conversation through the observer, and supervises the
 // pieces until the session ends.
 //
-// Current scope: the harness observes but does not yet refuse. It proxies
-// byte-faithfully; records the decidable methods into a hash-chained audit
-// log and fingerprints the advertised manifest for rug-pull drift (via
-// internal/observe); accepts a servant connection if the child dials one and
-// acks it in observe mode; and tolerates a child that never dials at all,
-// because a proxy that cannot wrap today's shipped server would never be
-// adopted. Verdicts and refusals wire onto this same observe seam next.
+// Current scope: the harness observes and, when given a policy, enforces. It
+// proxies byte-faithfully; records the decidable methods into a hash-chained
+// audit log and fingerprints the advertised manifest for rug-pull drift (via
+// internal/observe); and, when a policy document is configured, decides each
+// decidable request against a policy engine whose signals come from the servant
+// over the control channel, refusing a denied request on the wire so the server
+// never sees it (via internal/enforce). An enforcing policy begins the session
+// fail-closed until the engine is ready. It accepts a servant connection if the
+// child dials one, and tolerates a child that never dials at all, because a
+// proxy that cannot wrap today's shipped server would never be adopted. What
+// remains is for the governed server to shed its now-redundant in-process
+// enforcement when the harness signals it is enforcing.
 package harness
 
 import (
@@ -24,8 +29,10 @@ import (
 	"time"
 
 	"github.com/deploymenttheory/agentweave-harness/guardrails/audit"
+	"github.com/deploymenttheory/agentweave-harness/guardrails/policy"
 	"github.com/deploymenttheory/agentweave-harness/guardrails/watch"
 	"github.com/deploymenttheory/agentweave-harness/internal/control"
+	"github.com/deploymenttheory/agentweave-harness/internal/enforce"
 	"github.com/deploymenttheory/agentweave-harness/internal/observe"
 	"github.com/deploymenttheory/agentweave-harness/internal/proxy"
 	"github.com/deploymenttheory/agentweave-harness/wire"
@@ -44,6 +51,11 @@ type Config struct {
 	ClientIn  io.Reader
 	ClientOut io.Writer
 
+	// PolicyConfig is the path to the device-policy document the harness
+	// enforces. Empty means the harness only observes (records and fingerprints
+	// but refuses nothing). A document in audit mode records intended verdicts
+	// without refusing; a document in enforce mode refuses on the wire.
+	PolicyConfig string
 	// AuditSink is where the harness audit chain is written: "" or "stderr"
 	// for the stderr stream (AUDIT {json} lines), a directory for a sealed
 	// per-session file, or a plain path for an appended JSONL file.
@@ -110,10 +122,52 @@ func Run(ctx context.Context, cfg Config) error {
 	logger.Info("harness: governed server started",
 		"pid", child.Process.Pid, "argv0", cfg.Argv[0])
 
-	// Servant acceptance runs concurrently with the session: a Phase-3+
-	// server dials during startup; an older server never does. Token
-	// mismatch is the one outcome that must end the session — an
-	// unauthenticated peer means the bootstrap secret leaked.
+	// The policy the harness enforces is loaded before the pump starts, so its
+	// mode is known: an enforcing document means the session begins fail-closed
+	// (decidable calls refused until the engine is ready) rather than leaving an
+	// unadjudicated window before the servant connects.
+	policyDoc, err := loadHarnessPolicy(cfg.PolicyConfig)
+	if err != nil {
+		return err
+	}
+
+	// The observer records the proxied conversation into a hash-chained audit
+	// log and fingerprints the advertised manifest for rug-pull drift, and its
+	// tool index feeds the policy engine.
+	stamp := cfg.SessionStamp
+	if stamp == "" {
+		stamp = "harness"
+	}
+	auditDest, err := audit.OpenDestination(cfg.AuditSink, stamp)
+	if err != nil {
+		return fmt.Errorf("harness: audit destination: %w", err)
+	}
+	auditLog := audit.NewAuditLog(auditDest)
+	defer func() { _ = auditLog.Close() }()
+	rp := watch.NewRugPull(func(reason string) {
+		logger.Warn("rug-pull drift observed (report-only)", "reason", reason)
+	}, auditLog)
+	obs := observe.New(auditLog, rp, logger)
+
+	_, _ = auditLog.Append("harness.session.started", map[string]any{"argv0": cfg.Argv[0]})
+
+	p := proxy.New(clientIn, clientOut, serverIn, serverOut, obs)
+	// Fail closed while enforcement initializes: an enforcing policy must not
+	// leave decidable calls unadjudicated in the window before the servant has
+	// connected and its signals are reachable. Non-decidable traffic
+	// (initialize, tools/list) is unaffected, so the handshake still proceeds.
+	if policyDoc != nil && policyDoc.Mode == policy.ModeEnforcing {
+		p.SetInterceptor(enforce.NewInterceptor(
+			enforce.DenyAll{Reason: "policy engine initializing"}, logger))
+	}
+
+	// Servant acceptance runs concurrently with the session: a Phase-3+ server
+	// dials during startup; an older server never does. Once it connects, the
+	// harness completes the handshake, builds the policy engine over the
+	// observer's tool index and the servant's signals, and swaps the fail-closed
+	// interceptor for the real decider. Token mismatch is the one outcome that
+	// must end the session — an unauthenticated peer means the bootstrap secret
+	// leaked.
 	servantFatal := make(chan error, 1)
 	go func() {
 		sess, aerr := host.AwaitServant(ctx)
@@ -137,35 +191,15 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.Error("harness: hello.ack failed", "err", err)
 			return
 		}
+		// Build enforcement now that the signal source (the servant) is reachable.
+		// Serve must run concurrently for the engine's signal round-trips to be
+		// answered, so it is started after the interceptor swap, below.
+		installEnforcement(p, sess, policyDoc, obs, auditLog, logger)
 		if err := sess.Serve(logger, servantHandlers(logger)); err != nil {
 			logger.Error("harness: control channel failed", "err", err)
 		}
 	}()
 
-	// The observer records the proxied conversation into a hash-chained audit
-	// log and fingerprints the advertised manifest for rug-pull drift. This is
-	// the observe half of moving adjudication out of the server; it records and
-	// detects but refuses nothing (mode is still observe).
-	stamp := cfg.SessionStamp
-	if stamp == "" {
-		stamp = "harness"
-	}
-	auditDest, err := audit.OpenDestination(cfg.AuditSink, stamp)
-	if err != nil {
-		return fmt.Errorf("harness: audit destination: %w", err)
-	}
-	auditLog := audit.NewAuditLog(auditDest)
-	defer func() { _ = auditLog.Close() }()
-	// A drift detected while observing is recorded and logged, not acted on:
-	// containment is the enforcing half, wired on this same detector later.
-	rp := watch.NewRugPull(func(reason string) {
-		logger.Warn("rug-pull drift observed (report-only)", "reason", reason)
-	}, auditLog)
-	obs := observe.New(auditLog, rp, logger)
-
-	_, _ = auditLog.Append("harness.session.started", map[string]any{"argv0": cfg.Argv[0]})
-
-	p := proxy.New(clientIn, clientOut, serverIn, serverOut, obs)
 	if cfg.DriftInterval > 0 {
 		go driftMonitor(ctx, p, obs, logger, cfg.DriftInterval)
 	}

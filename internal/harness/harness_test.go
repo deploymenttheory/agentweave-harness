@@ -29,7 +29,56 @@ func TestMain(m *testing.M) {
 		fakeServerEcho()
 	case "servant":
 		fakeServerServant()
+	case "signal-servant":
+		fakeSignalServant()
 	}
+}
+
+// fakeSignalServant dials the control channel advertising a "tpm" signal, then
+// answers every signal.evaluate with a FAILING result for the requested ids —
+// enough for the harness's policy engine to deny a rule that requires tpm. It
+// serves stdio concurrently, like a real Phase-3 server.
+func fakeSignalServant() {
+	conn, err := control.Dial(os.Getenv(control.EnvPipe))
+	if err != nil {
+		os.Exit(3)
+	}
+	w := wire.NewWriter(conn)
+	hello, _ := wire.Marshal(1, wire.TypeHello, "", "", wire.Hello{
+		ProtoMin: wire.MinProtocolVersion, ProtoMax: wire.MaxProtocolVersion,
+		Token: os.Getenv(control.EnvToken), SessionStamp: "fake",
+		Capabilities: wire.Capabilities{Signals: []string{"tpm"}},
+	})
+	if err := w.Write(hello); err != nil {
+		os.Exit(3)
+	}
+	r := wire.NewReader(conn)
+	ack, err := r.Read()
+	if err != nil || ack.Type != wire.TypeHelloAck {
+		os.Exit(4)
+	}
+	// Answer control requests: a signal.evaluate gets a failing result per id.
+	go func() {
+		for {
+			env, err := r.Read()
+			if err != nil {
+				return
+			}
+			if env.Type != wire.TypeSignalEvaluate {
+				continue
+			}
+			var req wire.SignalEvaluate
+			_ = wire.Unmarshal(env, &req)
+			results := make([]json.RawMessage, 0, len(req.IDs))
+			for _, id := range req.IDs {
+				results = append(results, json.RawMessage(
+					`{"id":"`+id+`","status":"fail","detail":"tpm absent"}`))
+			}
+			reply, _ := wire.Marshal(1, wire.TypeSignalResult, "", env.ID, wire.SignalResult{Results: results})
+			_ = w.Write(reply)
+		}
+	}()
+	fakeServerEcho()
 }
 
 // fakeServerEcho is a pre-Phase-3 server: speaks MCP-ish stdio only, never
@@ -136,6 +185,46 @@ func TestRunAuditsProxiedToolCalls(t *testing.T) {
 	if strings.Contains(chain, "topsecret") {
 		t.Fatalf("raw argument value leaked into the audit chain:\n%s", chain)
 	}
+}
+
+// TestRunEnforcesPolicyOverTheChannel is the Phase-4b end-to-end pin: an
+// enforcing policy whose rule requires a signal the servant reports as failing
+// causes the harness to refuse the tool call on the wire — the client gets an
+// IsError result and the server (the echo half) never sees the call.
+func TestRunEnforcesPolicyOverTheChannel(t *testing.T) {
+	policyPath := filepath.Join(t.TempDir(), "policy.json")
+	policyDoc := `{
+	  "version": 1,
+	  "mode": "enforce",
+	  "signals": {"tpm": {"ttl": "0s"}},
+	  "rules": [
+	    {"name": "shell-needs-tpm", "match": {"tool": "Shell"}, "require": ["tpm"], "on_fail": "deny"}
+	  ]
+	}`
+	if err := os.WriteFile(policyPath, []byte(policyDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	in, out, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
+
+	// Give the servant a moment to connect and enforcement to activate, so the
+	// call is decided rather than caught by the fail-closed initializer (either
+	// way it is refused; this asserts the policy path specifically).
+	call := `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Shell","arguments":{"cmd":"whoami"}}}`
+	if _, err := io.WriteString(in, call+"\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := waitContains(t, out, `"c1"`)
+	if !strings.Contains(got, `"isError":true`) {
+		t.Fatalf("tools/call was not refused with an IsError result:\n%s", got)
+	}
+	// The echo server answers with {"echo":true}; a refused call must not have
+	// reached it.
+	if strings.Contains(got, `"echo":true`) {
+		t.Fatalf("refused call reached the server (saw echo):\n%s", got)
+	}
+	drainClean(t, in, done)
 }
 
 type lockedBuffer struct {

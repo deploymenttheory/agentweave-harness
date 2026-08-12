@@ -21,6 +21,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/deploymenttheory/agentweave-harness/wire"
@@ -44,6 +46,8 @@ var (
 	// ErrNoCommonVersion reports disjoint protocol ranges. The session must
 	// be refused, never run degraded.
 	ErrNoCommonVersion = errors.New("control: no common protocol version")
+	// ErrChannelClosed reports a Request left in flight when the channel ended.
+	ErrChannelClosed = errors.New("control: channel closed")
 )
 
 // Host owns the listener and the token for one session.
@@ -84,6 +88,13 @@ type Session struct {
 	conn net.Conn
 	r    *wire.Reader
 	w    *wire.Writer
+
+	// pending correlates a harness-originated request id to the caller waiting
+	// for its response. Serve delivers a matching `re` here before dispatching
+	// by type, so Request and the notification handlers share one read loop.
+	pmu     sync.Mutex
+	nextID  uint64
+	pending map[string]chan wire.Envelope
 }
 
 // AwaitServant accepts one connection and runs the hello exchange. It does
@@ -154,6 +165,7 @@ func (h *Host) AwaitServant(ctx context.Context) (*Session, error) {
 		conn:    conn,
 		r:       r,
 		w:       wire.NewWriter(conn),
+		pending: map[string]chan wire.Envelope{},
 	}, nil
 }
 
@@ -192,6 +204,69 @@ func (s *Session) Send(typ, id, re string, payload any) error {
 	return s.w.Write(env)
 }
 
+// Request sends a harness-originated request and waits for the servant's
+// correlated response, which Serve delivers by matching its `re` to this
+// request's id. Serve must be running concurrently — it owns the read loop —
+// or the response is never routed. A response whose payload is a `{"error":...}`
+// object is returned as-is for the caller to interpret.
+func (s *Session) Request(ctx context.Context, typ string, payload any) (wire.Envelope, error) {
+	s.pmu.Lock()
+	s.nextID++
+	id := "h" + strconv.FormatUint(s.nextID, 10)
+	sink := make(chan wire.Envelope, 1)
+	s.pending[id] = sink
+	s.pmu.Unlock()
+
+	defer func() {
+		s.pmu.Lock()
+		delete(s.pending, id)
+		s.pmu.Unlock()
+	}()
+
+	if err := s.Send(typ, id, "", payload); err != nil {
+		return wire.Envelope{}, err
+	}
+	select {
+	case env, ok := <-sink:
+		if !ok {
+			return wire.Envelope{}, fmt.Errorf("control: request %s: %w", typ, ErrChannelClosed)
+		}
+		return env, nil
+	case <-ctx.Done():
+		return wire.Envelope{}, fmt.Errorf("control: request %s: %w", typ, ctx.Err())
+	}
+}
+
+// deliver routes a response envelope to a waiting Request. It reports whether
+// the envelope was a correlated response (and thus consumed).
+func (s *Session) deliver(env wire.Envelope) bool {
+	if env.Re == "" {
+		return false
+	}
+	s.pmu.Lock()
+	sink, ok := s.pending[env.Re]
+	if ok {
+		delete(s.pending, env.Re)
+	}
+	s.pmu.Unlock()
+	if !ok {
+		return false
+	}
+	sink <- env
+	return true
+}
+
+// closePending fails any in-flight Request when the channel ends, so a caller
+// blocked in Request unblocks rather than waiting for its context.
+func (s *Session) closePending() {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	for id, sink := range s.pending {
+		close(sink)
+		delete(s.pending, id)
+	}
+}
+
 // Close closes the connection.
 func (s *Session) Close() error {
 	if err := s.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -212,6 +287,7 @@ type Handler func(env wire.Envelope) error
 // carrying an id, expecting an answer — gets an error reply so the peer
 // fails loudly instead of hanging. io.EOF is a clean channel end.
 func (s *Session) Serve(logger *slog.Logger, handlers map[string]Handler) error {
+	defer s.closePending()
 	for {
 		env, err := s.r.Read()
 		if err != nil {
@@ -219,6 +295,10 @@ func (s *Session) Serve(logger *slog.Logger, handlers map[string]Handler) error 
 				return nil
 			}
 			return fmt.Errorf("control: serve: %w", err)
+		}
+		// A correlated response goes to the waiting Request, not a handler.
+		if s.deliver(env) {
+			continue
 		}
 		h, ok := handlers[env.Type]
 		if !ok {

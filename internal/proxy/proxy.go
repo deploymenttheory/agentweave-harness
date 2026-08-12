@@ -74,12 +74,14 @@ type Interceptor interface {
 // Proxy pumps frames between a client (stdin/stdout of the harness) and a
 // server (stdin/stdout of the child process).
 type Proxy struct {
-	clientIn    io.Reader // frames from the MCP client
-	clientOut   io.Writer // frames to the MCP client
-	serverIn    io.Writer // frames to the governed server
-	serverOut   io.Reader // frames from the governed server
-	obs         Observer
-	interceptor Interceptor // nil = never refuse (pure proxy)
+	clientIn  io.Reader // frames from the MCP client
+	clientOut io.Writer // frames to the MCP client
+	serverIn  io.Writer // frames to the governed server
+	serverOut io.Reader // frames from the governed server
+	obs       Observer
+
+	imu         sync.RWMutex // guards interceptor (swappable while pumping)
+	interceptor Interceptor  // nil = never refuse (pure proxy)
 
 	mu            sync.Mutex
 	nextID        uint64
@@ -90,8 +92,21 @@ type Proxy struct {
 	closed        bool
 }
 
-// SetInterceptor installs the refusal seam. It must be called before Run.
-func (p *Proxy) SetInterceptor(i Interceptor) { p.interceptor = i }
+// SetInterceptor installs (or replaces) the refusal seam. It is safe to call
+// while Run is pumping — the enforcement decider is built once the servant
+// connects, after the pump has started — so a session can begin fail-closed
+// and swap to the policy decider without a restart.
+func (p *Proxy) SetInterceptor(i Interceptor) {
+	p.imu.Lock()
+	p.interceptor = i
+	p.imu.Unlock()
+}
+
+func (p *Proxy) getInterceptor() Interceptor {
+	p.imu.RLock()
+	defer p.imu.RUnlock()
+	return p.interceptor
+}
 
 // New builds a proxy over the four streams. obs must not be nil; use
 // NopObserver.
@@ -194,8 +209,8 @@ func (p *Proxy) pumpClientToServer() error {
 			// The refusal seam runs before forwarding: a refused request is
 			// answered to the client and never reaches the server. Observation
 			// still happened above, so a refused call is recorded like any other.
-			if p.interceptor != nil {
-				if refusal := p.interceptor.Intercept(line); refusal != nil {
+			if interceptor := p.getInterceptor(); interceptor != nil {
+				if refusal := interceptor.Intercept(line); refusal != nil {
 					if werr := p.writeClient(refusal); werr != nil {
 						return werr
 					}

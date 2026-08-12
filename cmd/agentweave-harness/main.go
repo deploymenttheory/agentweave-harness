@@ -49,14 +49,18 @@ func main() {
 			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 			sink, _ := cmd.Flags().GetString("audit-sink")
 			drift, _ := cmd.Flags().GetDuration("drift-interval")
+			policyPath, _ := cmd.Flags().GetString("policy-config")
 			return harness.Run(cmd.Context(), harness.Config{
 				Argv:          args,
 				Logger:        logger,
+				PolicyConfig:  policyPath,
 				AuditSink:     sink,
 				DriftInterval: drift,
 			})
 		},
 	}
+	runCmd.Flags().String("policy-config", "",
+		"path to the device-policy document to enforce (empty: observe only)")
 	runCmd.Flags().String("audit-sink", "stderr",
 		`where to write the audit chain: "stderr", a directory (sealed per-session file), or a file path`)
 	runCmd.Flags().Duration("drift-interval", 0,

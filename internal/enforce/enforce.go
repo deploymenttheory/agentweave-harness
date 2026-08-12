@@ -50,6 +50,20 @@ type Decider interface {
 	Decide(ctx context.Context, method string, params json.RawMessage) (allow bool, reason string)
 }
 
+// DenyAll refuses every decidable request with a fixed reason. It is the
+// fail-closed decider installed while the policy engine is still initializing
+// (before the servant has connected and its signals are reachable): an
+// operator who configured enforcement must not get an unadjudicated window,
+// so decidable calls are refused until the real decider is ready. Non-decidable
+// traffic — initialize, tools/list, notifications — is unaffected, because the
+// Interceptor never consults the decider for those.
+type DenyAll struct{ Reason string }
+
+// Decide always refuses.
+func (d DenyAll) Decide(context.Context, string, json.RawMessage) (bool, string) {
+	return false, d.Reason
+}
+
 // Interceptor implements proxy.Interceptor over a Decider. It only ever refuses
 // the five decidable request methods; everything else it forwards untouched by
 // returning nil.
