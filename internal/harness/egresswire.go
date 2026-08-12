@@ -99,6 +99,16 @@ func proxyPort(addr string) (int, error) {
 // config and the ack can only add to them.
 func effectiveConfig(layers *sessionLayers, egressPort int) wire.EffectiveConfig {
 	ec := wire.EffectiveConfig{EgressProxyPort: egressPort}
+	if egressPort != 0 {
+		// The firewall allow rule under a global outbound block must name the
+		// process actually dialing out — this one, now that the proxy runs
+		// harness-side. Best effort: an empty path degrades to the server
+		// falling back to its own executable, which the server-side spec
+		// treats as the standalone case.
+		if exe, err := os.Executable(); err == nil {
+			ec.EgressProxyExecutable = exe
+		}
+	}
 	if layers.composed != nil {
 		ec.EnforceHTTPS = layers.composed.Config.EnforceHTTPS
 		ec.Banner = layers.composed.Config.Transparency.Banner

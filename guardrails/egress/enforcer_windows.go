@@ -335,11 +335,13 @@ func isOwnRuleName(name string) bool {
 }
 
 // addGlobalAllowRules installs the proxy's own route out plus the exception set
-// that keeps the machine functioning under a block-by-default policy.
+// that keeps the machine functioning under a block-by-default policy. The
+// allow rule names the process actually serving the proxy — the harness
+// binary when the proxy runs harness-side, this one otherwise.
 func addGlobalAllowRules(rules *windowsfirewall.INetFwRules, spec EnforceSpec) error {
-	exe, err := os.Executable()
+	exe, err := proxyAllowExecutable(spec, os.Executable)
 	if err != nil {
-		return fmt.Errorf("locate this executable for the proxy allow rule: %w", err)
+		return fmt.Errorf("locate the proxy executable for the allow rule: %w", err)
 	}
 	if err := addProxyAllowRule(rules, exe, proxyAllowPorts(spec)); err != nil {
 		return err

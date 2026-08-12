@@ -49,6 +49,23 @@ type EnforceSpec struct {
 	AllowPorts []int
 	// SetSystemProxy points this user's WinINET settings at ProxyAddr.
 	SetSystemProxy bool
+	// ProxyExecutable is the full image path of the process serving the proxy,
+	// for the outbound allow rule under GlobalBlock. Empty means the proxy
+	// runs in this process (the standalone case) and the rule names this
+	// executable. A harness-side proxy names the harness binary here: an
+	// allow rule for the wrong process is a grant nothing uses and a block of
+	// the process actually dialing out.
+	ProxyExecutable string
+}
+
+// proxyAllowExecutable resolves which image the GlobalBlock allow rule names:
+// the declared proxy process, or — when none is declared — this one, resolved
+// by self. Split out so the preference is testable without a firewall.
+func proxyAllowExecutable(spec EnforceSpec, self func() (string, error)) (string, error) {
+	if spec.ProxyExecutable != "" {
+		return spec.ProxyExecutable, nil
+	}
+	return self()
 }
 
 // specNeedsAction reports whether a spec asks the OS layer to do anything at

@@ -159,6 +159,12 @@ type EffectiveConfig struct {
 	// port; the server then runs no proxy of its own and points its dialers
 	// and OS enforcement at this port.
 	EgressProxyPort int `json:"egress_proxy_port,omitempty"`
+	// EgressProxyExecutable is the full image path of the harness process
+	// serving that proxy, for the firewall allow rule under a global outbound
+	// block: the rule must name the process actually dialing out, or it is a
+	// grant nothing uses. Host-local by nature — both processes share the
+	// machine.
+	EgressProxyExecutable string `json:"egress_proxy_executable,omitempty"`
 	// HeartbeatIntervalMS is how often the servant pushes heartbeats.
 	HeartbeatIntervalMS int `json:"heartbeat_interval_ms,omitempty"`
 }

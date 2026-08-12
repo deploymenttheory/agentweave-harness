@@ -508,6 +508,11 @@ func TestHarnessRunsEgressProxyAndAnnouncesPort(t *testing.T) {
 	if ha.EffectiveConfig.EgressProxyPort == 0 {
 		t.Fatal("the ack announced no egress proxy port")
 	}
+	// The firewall allow rule under a global block must name the process
+	// serving the proxy, so the harness announces its own image path.
+	if ha.EffectiveConfig.EgressProxyExecutable == "" {
+		t.Fatal("the ack announced a proxy port but not the proxy's executable")
+	}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(context.Background(), "tcp",
 		"127.0.0.1:"+strconv.Itoa(ha.EffectiveConfig.EgressProxyPort))
