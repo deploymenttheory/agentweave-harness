@@ -50,17 +50,22 @@ func main() {
 			sink, _ := cmd.Flags().GetString("audit-sink")
 			drift, _ := cmd.Flags().GetDuration("drift-interval")
 			policyPath, _ := cmd.Flags().GetString("policy-config")
+			manifestPath, _ := cmd.Flags().GetString("session-manifest")
 			return harness.Run(cmd.Context(), harness.Config{
-				Argv:          args,
-				Logger:        logger,
-				PolicyConfig:  policyPath,
-				AuditSink:     sink,
-				DriftInterval: drift,
+				Argv:            args,
+				Logger:          logger,
+				PolicyConfig:    policyPath,
+				SessionManifest: manifestPath,
+				AuditSink:       sink,
+				DriftInterval:   drift,
 			})
 		},
 	}
 	runCmd.Flags().String("policy-config", "",
-		"path to the device-policy document to enforce (empty: observe only)")
+		"path to the user device-policy document; composes narrow-only with "+
+			harness.EnvManagedPolicy+" and --session-manifest (empty: no user layer)")
+	runCmd.Flags().String("session-manifest", "",
+		"path to a bounded, expiring session manifest enforced on the wire (empty: no manifest)")
 	runCmd.Flags().String("audit-sink", "stderr",
 		`where to write the audit chain: "stderr", a directory (sealed per-session file), or a file path`)
 	runCmd.Flags().Duration("drift-interval", 0,

@@ -19,10 +19,13 @@ type fakeDecider struct {
 	lastRaw json.RawMessage
 }
 
-func (d *fakeDecider) Decide(_ context.Context, method string, params json.RawMessage) (bool, string) {
+func (d *fakeDecider) Decide(_ context.Context, method string, params json.RawMessage) Decision {
 	d.seen = append(d.seen, method)
 	d.lastRaw = params
-	return !d.deny, d.reason
+	if d.deny {
+		return Decision{Reason: d.reason}
+	}
+	return Allowed()
 }
 
 func mustFrame(t *testing.T, b []byte) map[string]any {
@@ -146,19 +149,22 @@ func TestPolicyDeciderRefusesOnFailingSignal(t *testing.T) {
 
 	// Signal failing → deny.
 	failEng := policytest.NewEngine(pol, index, map[string]signals.Status{"tpm-present": signals.Fail})
-	dec := NewPolicyDecider(failEng, nil, nil)
-	allow, reason := dec.Decide(context.Background(), "tools/call", []byte(`{"name":"Shell"}`))
-	if allow {
+	dec := NewPolicyDecider([]*policy.Engine{failEng}, nil, nil)
+	d := dec.Decide(context.Background(), "tools/call", []byte(`{"name":"Shell"}`))
+	if d.Allow {
 		t.Fatal("failing signal did not deny the destructive tool")
 	}
-	if reason == "" {
+	if d.Reason == "" {
 		t.Error("deny carried no reason")
+	}
+	if d.Code != "" {
+		t.Errorf("a policy-rule denial carries typed code %q; the codes name manifest refusals only", d.Code)
 	}
 
 	// Signal passing → allow.
 	passEng := policytest.NewEngine(pol, index, map[string]signals.Status{"tpm-present": signals.Pass})
-	if allow, _ := NewPolicyDecider(passEng, nil, nil).Decide(
-		context.Background(), "tools/call", []byte(`{"name":"Shell"}`)); !allow {
+	if d := NewPolicyDecider([]*policy.Engine{passEng}, nil, nil).Decide(
+		context.Background(), "tools/call", []byte(`{"name":"Shell"}`)); !d.Allow {
 		t.Fatal("passing signal did not allow the tool")
 	}
 }
@@ -171,8 +177,8 @@ func TestPolicyDeciderAuditModeForwards(t *testing.T) {
 	pol.Mode = policy.ModeAuditOnly
 	index := policytest.StaticIndex{"Shell": {Name: "Shell", Destructive: true}}
 	eng := policytest.NewEngine(pol, index, map[string]signals.Status{"tpm-present": signals.Fail})
-	if allow, _ := NewPolicyDecider(eng, nil, nil).Decide(
-		context.Background(), "tools/call", []byte(`{"name":"Shell"}`)); !allow {
+	if d := NewPolicyDecider([]*policy.Engine{eng}, nil, nil).Decide(
+		context.Background(), "tools/call", []byte(`{"name":"Shell"}`)); !d.Allow {
 		t.Fatal("audit mode refused; it must observe, not refuse")
 	}
 }
