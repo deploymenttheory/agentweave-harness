@@ -1,0 +1,51 @@
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw managed-enforcing: false
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw managed-rules: 2
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-kind: "tool"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-tool: "Snapshot"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-sig: "s0"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-sev: 1
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r1-kind: "tool"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r1-tool: "Snapshot"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r1-sig: "s0"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r1-sev: 1
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw user-enforcing: true
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw user-rules: 1
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-kind: "tool"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-tool: "Snapshot"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-sig: "s0"
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] [rapid] draw r0-sev: 3
+# 2026/08/12 14:42:55.507970 [TestLowerLayersOnlyNarrow] composition widened user for Snapshot: composed warn < user deny
+# 
+v0.4.8#16485144144511566619
+0x0
+0x0
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1

@@ -53,6 +53,7 @@ this order**:
 | `plan` | plan compile/validate/derive | — |
 | `telemetry` | OTLP metrics/traces | — |
 | `policy` | document schema, signal cache, engine, verdict | `signals`, `hostmatch` |
+| `manifest` | session manifest, layered narrow-only composition, `MaxVerdict` | `policy`, `hostmatch`, `wire` |
 | `egress` | loopback proxy, counters, `Enforcer`, OS enforcement | `hostmatch`, `contain` |
 | `enforce` | the MCP middleware, refusal shapes | `policy`, `audit` |
 | `watch` | heartbeat, rug-pull, monitor | `audit`, `signals` |
@@ -75,6 +76,13 @@ Two properties to preserve:
   document is given; `TestDefaultPolicyIsAuditOnly` pins it (and pins egress
   default-off). `mode: audit` *caps* severity rather than skipping evaluation —
   the recorded `intended` verdict is what makes audit mode worth running.
+- **Never merge two layers' rules into one document.** The engine attributes
+  each required signal to its single most specific matching rule (ties: last
+  wins), so a merged document lets one layer's weaker rule shadow another's
+  stricter one — a widening. Layered decisions are strictest-of-per-layer
+  verdicts (`manifest.Compose` keeps `RuleLayers` separate, `MaxVerdict` takes
+  the max; `TestLowerLayersOnlyNarrow` is the property pin, and it is the test
+  that caught this).
 - **Transparency is never conditional on containment.** Every verdict is
   audited, including allows, including audit mode; the decision entry is written
   before any trip.
