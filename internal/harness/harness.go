@@ -113,6 +113,19 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	// The egress proxy runs harness-side for governed sessions: the composed,
+	// manifest-narrowed allowlist lives in this process where the contained
+	// server cannot reach it, and the port is announced in the hello.ack so
+	// the host's OS enforcement can point at it. Started before the child so
+	// the announced port is listening before anything could dial it.
+	egressSvc, egressPort, err := startEgressProxy(ctx, layers, logger)
+	if err != nil {
+		return err
+	}
+	if egressSvc != nil {
+		defer egressSvc.Stop()
+	}
+
 	host, err := control.NewHost(logger)
 	if err != nil {
 		return err
@@ -214,6 +227,14 @@ func Run(ctx context.Context, cfg Config) error {
 			"proto", sess.Version,
 			"signals", len(sess.Hello.Capabilities.Signals),
 			"elevated", sess.Hello.Capabilities.Elevated)
+		// The elevation gate runs at the handshake: a composed egress policy
+		// that needs OS actuation on a servant that cannot apply it must end
+		// the session, not degrade it — the same class of fatal as a bad
+		// token.
+		if err := requireServableEgress(layers, sess.Hello.Capabilities); err != nil {
+			servantFatal <- err
+			return
+		}
 		// Build enforcement before the ack, now that the signal source (the
 		// servant) is reachable. The ack's mode must be honest: `enforce` is
 		// what licenses the server to shed its own in-process enforcement, so
@@ -230,8 +251,11 @@ func Run(ctx context.Context, cfg Config) error {
 		if installEnforcement(p, sess, layers, obs, auditLog, logger) {
 			ackMode = wire.ModeEnforce
 		}
-		_, _ = auditLog.Append("harness.mode.acked", map[string]any{"mode": ackMode})
-		if err := sess.Ack(wire.HelloAck{Mode: ackMode}); err != nil {
+		ack := wire.HelloAck{Mode: ackMode, EffectiveConfig: effectiveConfig(layers, egressPort)}
+		_, _ = auditLog.Append("harness.mode.acked", map[string]any{
+			"mode": ackMode, "egress_proxy_port": ack.EffectiveConfig.EgressProxyPort,
+		})
+		if err := sess.Ack(ack); err != nil {
 			logger.Error("harness: hello.ack failed", "err", err)
 			return
 		}
