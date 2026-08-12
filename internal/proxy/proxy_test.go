@@ -315,3 +315,60 @@ func TestClientEOFEndsTheRunCleanly(t *testing.T) {
 		t.Fatal("Run did not return on client EOF")
 	}
 }
+
+// staticInjector appends fixed tools to every tools/list result.
+type staticInjector struct{ tools []json.RawMessage }
+
+func (s staticInjector) Tools() []json.RawMessage { return s.tools }
+
+// TestToolInjectionAppendsToTheClientsManifest pins the response-side
+// injection: a tools/list the client requested comes back with the harness's
+// tools appended, the server's own tools preserved, and the observer sees the
+// combined surface (so the fingerprint baseline is the manifest the client
+// sees). A tools/list the client did not request — an out-of-band one — is
+// untouched.
+func TestToolInjectionAppendsToTheClientsManifest(t *testing.T) {
+	obs := &collect{}
+	r := startRig(t, obs)
+	r.proxy.SetToolInjector(staticInjector{tools: []json.RawMessage{
+		json.RawMessage(`{"name":"GuardrailStatus"}`),
+	}})
+
+	// Client asks for tools/list.
+	if _, err := io.WriteString(r.clientToProxy,
+		`{"jsonrpc":"2.0","id":"t1","method":"tools/list"}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the request has been forwarded to the server before the server
+	// answers: in production the request always passes through the proxy (and
+	// is noted for injection) before the server can reply, so replying earlier
+	// is a race only this in-memory rig could create.
+	r.waitFor(t, r.serverInbox, `"tools/list"`)
+	// Server answers with one tool.
+	if _, err := io.WriteString(r.serverReply,
+		`{"jsonrpc":"2.0","id":"t1","result":{"tools":[{"name":"Snapshot"}]}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := r.waitFor(t, r.proxyToClient, "GuardrailStatus")
+	if !strings.Contains(got, "Snapshot") {
+		t.Fatalf("the server's own tool was dropped:\n%s", got)
+	}
+	// The observer must have seen the injected surface, not the raw one.
+	obs.mu.Lock()
+	serverFrames := append([][]byte(nil), obs.server...)
+	obs.mu.Unlock()
+	if !containsFrame(serverFrames, "GuardrailStatus") {
+		t.Fatal("the observer fingerprinted the pre-injection surface; the injected tools are outside the baseline")
+	}
+}
+
+// containsFrame reports whether any observed frame contains want.
+func containsFrame(frames [][]byte, want string) bool {
+	for _, f := range frames {
+		if strings.Contains(string(f), want) {
+			return true
+		}
+	}
+	return false
+}

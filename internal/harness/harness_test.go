@@ -270,6 +270,54 @@ func TestRunEnforcesPolicyOverTheChannel(t *testing.T) {
 	drainClean(t, in, done)
 }
 
+// TestEnforceModeInjectsGuardrailTools is the Phase-6 injection pin end to
+// end: under an enforcing session (where the server sheds its own
+// GuardrailStatus/Kill), the harness adds them to the manifest the client
+// sees, and answers a GuardrailStatus call itself — the server never sees it.
+func TestEnforceModeInjectsGuardrailTools(t *testing.T) {
+	policyPath := filepath.Join(t.TempDir(), "policy.json")
+	policyDoc := `{
+	  "version": 1, "mode": "enforce",
+	  "signals": {"tpm": {"ttl": "0s"}},
+	  "rules": [{"name": "r", "match": {"tool": "Shell"}, "require": ["tpm"], "on_fail": "deny"}]
+	}`
+	if err := os.WriteFile(policyPath, []byte(policyDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ackFile := filepath.Join(t.TempDir(), "ackmode")
+	t.Setenv(ackModeFileEnv, ackFile)
+	in, out, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
+
+	// Wait for the enforce ack so the injector is installed before we list.
+	if mode := waitAckMode(t, ackFile); mode != wire.ModeEnforce {
+		t.Fatalf("expected an enforce ack, got %q", mode)
+	}
+
+	// tools/list comes back with the injected tools appended.
+	if _, err := io.WriteString(in, `{"jsonrpc":"2.0","id":"l1","method":"tools/list"}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	listed := waitContains(t, out, `"l1"`)
+	if !strings.Contains(listed, "GuardrailStatus") || !strings.Contains(listed, `"Kill"`) {
+		t.Fatalf("injected tools absent from the manifest:\n%s", listed)
+	}
+
+	// A GuardrailStatus call is answered by the harness, not the echo server.
+	if _, err := io.WriteString(in,
+		`{"jsonrpc":"2.0","id":"g1","method":"tools/call","params":{"name":"GuardrailStatus"}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitContains(t, out, `"g1"`)
+	g1 := frameContaining(t, out, `"g1"`)
+	if strings.Contains(g1, `"echo":true`) {
+		t.Fatalf("GuardrailStatus reached the server (saw echo):\n%s", g1)
+	}
+	if !strings.Contains(g1, "enforce") {
+		t.Fatalf("GuardrailStatus did not report the harness posture:\n%s", g1)
+	}
+	drainClean(t, in, done)
+}
+
 // TestAckIsEnforceOnlyWhenDeciderInstalled pins the honest-ack invariant: the
 // hello.ack says `enforce` exactly when the harness installed a live policy
 // decider — not whenever the document asks for enforcement. An audit-mode
@@ -611,6 +659,20 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// frameContaining returns the single newline-delimited frame in the buffer
+// that contains want, so an assertion inspects one response rather than the
+// cumulative stream.
+func frameContaining(t *testing.T, b *lockedBuffer, want string) string {
+	t.Helper()
+	for _, line := range strings.Split(b.String(), "\n") {
+		if strings.Contains(line, want) {
+			return line
+		}
+	}
+	t.Fatalf("no frame containing %q in %q", want, b.String())
+	return ""
 }
 
 func waitContains(t *testing.T, b *lockedBuffer, want string) string {

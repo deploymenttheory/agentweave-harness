@@ -67,8 +67,24 @@ func (NopObserver) OnServerFrame([]byte) {}
 // Intercept runs on the client→server pump goroutine, so it must not block
 // indefinitely; a policy decision that needs to wait (an approval, a signal
 // round-trip) is the caller's responsibility to bound.
+//
+// The same seam answers calls to harness-injected tools: for a tools/call of
+// a tool the harness added to the manifest (see ToolInjector), Intercept
+// returns the tool's result frame — a success, not a refusal — so the call is
+// answered by the harness and never reaches the server, which does not have
+// that tool.
 type Interceptor interface {
 	Intercept(raw []byte) []byte
+}
+
+// ToolInjector adds tools to the manifest the client sees. Tools returns the
+// tool definitions (each the raw JSON of one MCP Tool object) to append to
+// every tools/list result the server sends. The client's manifest is then the
+// server's tools plus these, and the observer fingerprints that combined
+// surface — so the injected tools sit inside the rug-pull baseline, not
+// outside it. Calls to the injected tools are answered by the Interceptor.
+type ToolInjector interface {
+	Tools() []json.RawMessage
 }
 
 // Proxy pumps frames between a client (stdin/stdout of the harness) and a
@@ -80,15 +96,17 @@ type Proxy struct {
 	serverOut io.Reader // frames from the governed server
 	obs       Observer
 
-	imu         sync.RWMutex // guards interceptor (swappable while pumping)
+	imu         sync.RWMutex // guards interceptor + injector (swappable while pumping)
 	interceptor Interceptor  // nil = never refuse (pure proxy)
+	injector    ToolInjector // nil = inject nothing
 
 	mu            sync.Mutex
 	nextID        uint64
 	pending       map[string]chan []byte // injected id → response sink
 	remapped      map[string]json.RawMessage
-	writeMu       sync.Mutex // serializes serverIn writes (pump + Inject)
-	clientWriteMu sync.Mutex // serializes clientOut writes (server pump + refusals)
+	listReqs      map[string]struct{} // client tools/list request ids awaiting a response to inject into
+	writeMu       sync.Mutex          // serializes serverIn writes (pump + Inject)
+	clientWriteMu sync.Mutex          // serializes clientOut writes (server pump + refusals)
 	closed        bool
 }
 
@@ -108,6 +126,21 @@ func (p *Proxy) getInterceptor() Interceptor {
 	return p.interceptor
 }
 
+// SetToolInjector installs (or replaces) the tool-injection seam. Safe to call
+// while pumping, for the same reason SetInterceptor is: the injected manifest
+// is decided once the servant connects.
+func (p *Proxy) SetToolInjector(i ToolInjector) {
+	p.imu.Lock()
+	p.injector = i
+	p.imu.Unlock()
+}
+
+func (p *Proxy) getInjector() ToolInjector {
+	p.imu.RLock()
+	defer p.imu.RUnlock()
+	return p.injector
+}
+
 // New builds a proxy over the four streams. obs must not be nil; use
 // NopObserver.
 func New(clientIn io.Reader, clientOut io.Writer, serverIn io.Writer, serverOut io.Reader, obs Observer) *Proxy {
@@ -119,6 +152,7 @@ func New(clientIn io.Reader, clientOut io.Writer, serverIn io.Writer, serverOut 
 		obs:       obs,
 		pending:   map[string]chan []byte{},
 		remapped:  map[string]json.RawMessage{},
+		listReqs:  map[string]struct{}{},
 	}
 }
 
@@ -218,6 +252,7 @@ func (p *Proxy) pumpClientToServer() error {
 				}
 			}
 			{
+				p.noteListRequest(line)
 				out, werr := p.forwardClientFrame(line)
 				if werr != nil {
 					return werr
@@ -279,6 +314,62 @@ func (p *Proxy) forwardClientFrame(line []byte) ([]byte, error) {
 	return rewriteID(line, mappedRaw)
 }
 
+// noteListRequest records a client tools/list request id when a tool injector
+// is installed, so the matching response can have the injected tools appended.
+// Cheap and best-effort: no injector, nothing recorded.
+func (p *Proxy) noteListRequest(line []byte) {
+	if p.getInjector() == nil {
+		return
+	}
+	f := peekFrame(line)
+	if f.method != "tools/list" || f.id == nil {
+		return
+	}
+	var s string
+	if json.Unmarshal(f.id, &s) != nil {
+		return // a non-string id still routes; we only track string ids here
+	}
+	p.mu.Lock()
+	p.listReqs[s] = struct{}{}
+	p.mu.Unlock()
+}
+
+// maybeInjectTools appends the injector's tools to a tools/list response the
+// client requested. A response to an id we did not record, or with no
+// injector, or that does not parse, is returned untouched — byte-faithful is
+// the default; injection is the narrow exception.
+func (p *Proxy) maybeInjectTools(line []byte) []byte {
+	injector := p.getInjector()
+	if injector == nil {
+		return line
+	}
+	f := peekFrame(line)
+	if !f.isResponse || f.id == nil {
+		return line
+	}
+	var s string
+	if json.Unmarshal(f.id, &s) != nil {
+		return line
+	}
+	p.mu.Lock()
+	_, tracked := p.listReqs[s]
+	if tracked {
+		delete(p.listReqs, s)
+	}
+	p.mu.Unlock()
+	if !tracked {
+		return line
+	}
+	injected, err := appendTools(line, injector.Tools())
+	if err != nil {
+		// A malformed or unexpected tools/list body is forwarded untouched
+		// rather than dropped: the client seeing the server's manifest without
+		// the harness tools is a lesser failure than a broken response.
+		return line
+	}
+	return injected
+}
+
 func (p *Proxy) pumpServerToClient() error {
 	r := bufio.NewReaderSize(p.serverOut, 64*1024)
 	for {
@@ -289,6 +380,11 @@ func (p *Proxy) pumpServerToClient() error {
 				return werr
 			}
 			if forward {
+				// Injection happens before observation, so the fingerprint
+				// baseline is the manifest the client actually sees — the
+				// server's tools plus the harness's — and the injected tools
+				// sit inside the rug-pull baseline rather than outside it.
+				out = p.maybeInjectTools(out)
 				p.obs.OnServerFrame(out)
 				if werr := p.writeClient(out); werr != nil {
 					return werr

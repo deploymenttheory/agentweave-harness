@@ -247,8 +247,16 @@ func Run(ctx context.Context, cfg Config) error {
 		// servant blocks reading the ack, so nothing races this ordering;
 		// Serve (which answers the engines' signal round-trips) starts right
 		// after.
+		// stop ends the session for the injected Kill tool: a graceful cancel
+		// of the run context, the same non-authoritative stop the server's own
+		// Kill routed to — an agent can end its session but never escalate that
+		// into containment.
+		stop := func(reason string) {
+			logger.Info("harness: session stop requested via injected Kill tool", "reason", reason)
+			cancel()
+		}
 		ackMode := wire.ModeObserve
-		if installEnforcement(p, sess, layers, obs, auditLog, logger) {
+		if installEnforcement(p, sess, layers, obs, auditLog, logger, stop) {
 			ackMode = wire.ModeEnforce
 		}
 		ack := wire.HelloAck{Mode: ackMode, EffectiveConfig: effectiveConfig(layers, egressPort)}

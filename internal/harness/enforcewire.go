@@ -21,6 +21,7 @@ import (
 	"github.com/deploymenttheory/agentweave-harness/guardrails/signals"
 	"github.com/deploymenttheory/agentweave-harness/internal/control"
 	"github.com/deploymenttheory/agentweave-harness/internal/enforce"
+	"github.com/deploymenttheory/agentweave-harness/internal/inject"
 	"github.com/deploymenttheory/agentweave-harness/internal/observe"
 	"github.com/deploymenttheory/agentweave-harness/internal/proxy"
 )
@@ -120,6 +121,7 @@ func installEnforcement(
 	obs *observe.Observer,
 	auditLog *audit.AuditLog,
 	logger *slog.Logger,
+	stop func(reason string),
 ) bool {
 	if layers.composed == nil {
 		return false // no policy layers: any manifest gate installed pre-pump stands
@@ -139,10 +141,36 @@ func installEnforcement(
 	}
 	decider := enforce.NewPolicyDecider(engines, auditLog, logger)
 	gated := enforce.NewManifestGate(layers.session, decider, auditLog, logger, nil)
-	p.SetInterceptor(enforce.NewInterceptor(gated, logger))
+	interceptor := proxy.Interceptor(enforce.NewInterceptor(gated, logger))
+
+	// When the session is enforcing, the governed server has shed its own
+	// GuardrailStatus/Kill tools — so the harness injects its own into the
+	// manifest the client sees and answers their calls. The injecting
+	// interceptor sits outermost: an injected-tool call is answered here and
+	// never reaches the policy decider or the server.
+	if layers.enforcing() {
+		inj := inject.New(harnessStatus(layers), stop)
+		interceptor = inject.WrapInterceptor(inj, interceptor)
+		p.SetToolInjector(inj)
+	}
+	p.SetInterceptor(interceptor)
 	logger.Info("harness: enforcement active",
 		"mode", string(layers.composed.Config.Mode),
 		"rule_layers", len(layers.composed.RuleLayers),
 		"bounded", layers.bounded())
 	return layers.enforcing()
+}
+
+// harnessStatus builds the posture provider the injected GuardrailStatus tool
+// reports, closing over the composed layers so it stays current for the
+// session's lifetime.
+func harnessStatus(layers *sessionLayers) inject.StatusProvider {
+	return func() inject.Status {
+		return inject.Status{
+			Mode:       string(layers.composed.Config.Mode),
+			Enforcing:  layers.enforcing(),
+			Bounded:    layers.bounded(),
+			RuleLayers: len(layers.composed.RuleLayers),
+		}
+	}
 }

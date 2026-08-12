@@ -3,8 +3,13 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
+
+// errNoResult reports a tools/list response with no result member, so
+// appendTools has nowhere to add the injected tools.
+var errNoResult = errors.New("proxy: inject tools: response has no result")
 
 // frame is the peek view of one MCP stdio line: enough JSON-RPC structure to
 // route it, without touching the bytes that get forwarded. raw retains the
@@ -40,6 +45,51 @@ func peekFrame(line []byte) frame {
 	f.method = probe.Method
 	f.isResponse = probe.Method == "" && (probe.Result != nil || probe.Error != nil)
 	return f
+}
+
+// appendTools adds tool definitions to a tools/list response's result.tools
+// array. It re-marshals the result object (key order is not meaningful in
+// JSON-RPC), leaving the rest of the frame — id, jsonrpc, any nextCursor — in
+// place. A response without a result.tools array is an error: the caller
+// forwards the original untouched rather than guess.
+func appendTools(line []byte, tools []json.RawMessage) ([]byte, error) {
+	if len(tools) == 0 {
+		return line, nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(line), &obj); err != nil {
+		return nil, fmt.Errorf("proxy: inject tools: %w", err)
+	}
+	rawResult, ok := obj["result"]
+	if !ok {
+		return nil, errNoResult
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(rawResult, &result); err != nil {
+		return nil, fmt.Errorf("proxy: inject tools: result is not an object: %w", err)
+	}
+	list := make([]json.RawMessage, 0, len(tools))
+	if rawList, ok := result["tools"]; ok {
+		if err := json.Unmarshal(rawList, &list); err != nil {
+			return nil, fmt.Errorf("proxy: inject tools: result.tools is not an array: %w", err)
+		}
+	}
+	list = append(list, tools...)
+	mergedList, err := json.Marshal(list)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: inject tools: %w", err)
+	}
+	result["tools"] = mergedList
+	mergedResult, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: inject tools: %w", err)
+	}
+	obj["result"] = mergedResult
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: inject tools: %w", err)
+	}
+	return append(out, '\n'), nil
 }
 
 // rewriteID re-marshals the frame with a replacement "id". This is the one
