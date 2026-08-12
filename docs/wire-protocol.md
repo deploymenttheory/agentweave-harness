@@ -1,8 +1,14 @@
 # Control-channel wire protocol
 
-> **Status: DRAFT.** This document is ratified as the design intent, but the
-> protocol may change without ceremony until the harness tags v1.0.0. From
-> v1.0.0 the protocol is frozen and changes only through version negotiation.
+> **Status: FROZEN at protocol version 1 (harness v1.0.0).** The message
+> vocabulary, envelope, framing and typed refusal codes described here are
+> stable. `MinProtocolVersion == MaxProtocolVersion == 1`. A change to the wire
+> is now a protocol-version change, negotiated in `hello`/`hello.ack`: a
+> harness and server whose supported ranges are disjoint refuse to start the
+> session rather than run degraded. Additive, backward-compatible fields (a new
+> optional `effective_config` member, a new actuation rung) may still land
+> under version 1 — a reader ignores what it does not know — but a message
+> whose *meaning* changes, or a field that becomes required, moves the version.
 
 The control channel is the second link between the harness and the governed
 server (the first being the proxied MCP stdio stream). Signals flow up;
