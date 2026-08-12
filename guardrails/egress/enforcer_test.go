@@ -132,3 +132,22 @@ func TestSystemProxyIsNotGatedOnFirewallWork(t *testing.T) {
 		t.Error("flipping the machine's default outbound action must require elevation")
 	}
 }
+
+// TestProxyAllowExecutablePrefersTheDeclaredProcess pins the Phase-6 rule:
+// under a global outbound block the allow rule names the process actually
+// serving the proxy — the harness binary when one is declared — and only
+// falls back to this executable for the standalone case. An allow rule for
+// the wrong process is a grant nothing uses and a block of the process
+// actually dialing out.
+func TestProxyAllowExecutablePrefersTheDeclaredProcess(t *testing.T) {
+	self := func() (string, error) { return `C:\srv\windows-mcp-server.exe`, nil }
+
+	exe, err := proxyAllowExecutable(EnforceSpec{ProxyExecutable: `C:\hn\agentweave-harness.exe`}, self)
+	if err != nil || exe != `C:\hn\agentweave-harness.exe` {
+		t.Fatalf("declared proxy process not preferred: %q, %v", exe, err)
+	}
+	exe, err = proxyAllowExecutable(EnforceSpec{}, self)
+	if err != nil || exe != `C:\srv\windows-mcp-server.exe` {
+		t.Fatalf("standalone case did not fall back to self: %q, %v", exe, err)
+	}
+}
