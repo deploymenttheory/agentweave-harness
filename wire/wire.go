@@ -220,6 +220,27 @@ type Actuate struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
+// EgressApplyParams is the schema for the egress_apply rung's Params: the OS
+// firewall enforcement the harness asks the governed server to install on its
+// behalf, pointed at the harness-side proxy. It exists because the composed
+// egress policy lives harness-side while the actuation — firewall rules,
+// WinINET — must happen on the host. Suspend and restore carry no params.
+type EgressApplyParams struct {
+	// ProxyPort is the harness proxy's loopback port the blocked applications
+	// must still be able to reach.
+	ProxyPort int `json:"proxy_port"`
+	// ProxyExecutable is the harness image, for the global-block allow rule.
+	ProxyExecutable string `json:"proxy_executable,omitempty"`
+	// Applications are full image paths to block outbound (scoped tier).
+	Applications []string `json:"applications,omitempty"`
+	// BlockAllOutbound flips the machine's default outbound action (global tier).
+	BlockAllOutbound bool `json:"block_all_outbound,omitempty"`
+	// AllowPorts bounds the proxy's own allow rule under a global block.
+	AllowPorts []int `json:"allow_ports,omitempty"`
+	// SetSystemProxy points this user's WinINET settings at the proxy.
+	SetSystemProxy bool `json:"set_system_proxy,omitempty"`
+}
+
 // ActuateResult reports what actually happened, in the servant's
 // skip-and-audit idiom: a rung the process cannot perform is reported
 // skipped with a reason, not silently dropped and not faked.

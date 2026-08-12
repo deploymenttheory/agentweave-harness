@@ -259,6 +259,14 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.Error("harness: hello.ack failed", "err", err)
 			return
 		}
+		// The composed egress policy lives here, but its OS enforcement —
+		// firewall rules, WinINET — must happen on the host. Push it as an
+		// actuation once the channel is serving: the round-trip's reply is
+		// delivered by Serve's loop, so this runs concurrently with it. A
+		// proxy with no OS enforcement (proxy-only tier) pushes nothing.
+		if egressPort != 0 && egressNeedsActuation(layers) {
+			go pushEgressEnforcement(ctx, sess, layers, egressPort, auditLog, logger)
+		}
 		if err := sess.Serve(logger, servantHandlers(logger)); err != nil {
 			logger.Error("harness: control channel failed", "err", err)
 		}
