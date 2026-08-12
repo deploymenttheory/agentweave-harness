@@ -65,7 +65,7 @@ picks a version or refuses:
 
 | Type | Payload | Notes |
 |---|---|---|
-| `hello.ack` | `proto`, `mode: enforce\|observe`, `effective_config: {enforce_https, protected_paths, banner, egress_proxy_port?, heartbeat_interval}` | Config the server must apply before building its tool surface |
+| `hello.ack` | `proto`, `mode: enforce\|observe`, `effective_config: {enforce_https, protected_paths, banner, egress_proxy_port?, heartbeat_interval}` | Config the server must apply before building its tool surface. `mode: enforce` is acked **only when the harness's policy decider is actually installed** — an enforcing document that fails validation against this servant's signals, or one in audit mode, acks `observe` — because the ack is what licenses the server to shed its in-process enforcement, and it must never do so opposite a harness that is not refusing |
 | `signal.evaluate` | `id`, `ids: [signal-ids]`, `args` | **By declared signal id only — there is no generic shell/exec verb, by construction** |
 | `actuate` | `id`, `rung`, `params` | Rungs: `banner`, `seal`, `finalize_recording`, `credential_cleanup`, `isolate`, `kill_procs`, `lock`, `shutdown`, `egress_apply`, `egress_suspend`, `egress_restore` |
 | `plan.verdict` | `re`, verdict | Answer to `plan.evaluate` |
