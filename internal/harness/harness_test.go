@@ -328,6 +328,106 @@ func waitAckMode(t *testing.T, path string) string {
 	return ""
 }
 
+// writeSessionManifest writes a manifest document for a test session.
+func writeSessionManifest(t *testing.T, doc string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestUndeclaredToolGetsTypedRefusal is the manifest pin end to end: a
+// manifest-only session (no policy layers, no servant) refuses a tools/call
+// outside allow.tools with the typed permission_denied code, the refused call
+// never reaches the server, and a granted call flows through untouched.
+func TestUndeclaredToolGetsTypedRefusal(t *testing.T) {
+	path := writeSessionManifest(t,
+		`{"version": 1, "expires_after": "1h", "allow": {"tools": ["Snapshot"]}}`)
+	in, out, done := runHarnessCfg(t, "echo", Config{SessionManifest: path})
+
+	call := `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Shell","arguments":{}}}`
+	if _, err := io.WriteString(in, call+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	got := waitContains(t, out, `"c1"`)
+	if !strings.Contains(got, `"isError":true`) || !strings.Contains(got, "permission_denied") {
+		t.Fatalf("undeclared tool was not refused with the typed code:\n%s", got)
+	}
+	if strings.Contains(got, `"echo":true`) {
+		t.Fatalf("refused call reached the server:\n%s", got)
+	}
+
+	granted := `{"jsonrpc":"2.0","id":"c2","method":"tools/call","params":{"name":"Snapshot","arguments":{}}}`
+	if _, err := io.WriteString(in, granted+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitContains(t, out, `"c2"`); !strings.Contains(got, `"echo":true`) {
+		t.Fatalf("granted tool did not flow through:\n%s", got)
+	}
+	drainClean(t, in, done)
+}
+
+// TestResourceOutsideManifestIsTypedJSONRPCError pins the other refusal shape:
+// a resources/read outside the grant is a JSON-RPC error carrying the typed
+// code as structured data, so a client can match on it without parsing prose.
+func TestResourceOutsideManifestIsTypedJSONRPCError(t *testing.T) {
+	path := writeSessionManifest(t,
+		`{"version": 1, "expires_after": "1h", "allow": {"resources": {"files": ["C:\\work"]}}}`)
+	in, out, done := runHarnessCfg(t, "echo", Config{SessionManifest: path})
+
+	read := `{"jsonrpc":"2.0","id":"r1","method":"resources/read","params":{"uri":"file:///C:/secrets/key.pem"}}`
+	if _, err := io.WriteString(in, read+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	got := waitContains(t, out, `"r1"`)
+	if !strings.Contains(got, `"error"`) ||
+		!strings.Contains(got, `"data":{"code":"bounded_resource_outside_manifest"}`) {
+		t.Fatalf("out-of-grant read was not a typed JSON-RPC error:\n%s", got)
+	}
+	drainClean(t, in, done)
+}
+
+// TestExpiredManifestDrainsTheSession pins expiry end to end: past
+// expires_after every decidable request gets session_expired in the method's
+// shape — the session drains rather than being killed, so the pump and the
+// child stay up.
+func TestExpiredManifestDrainsTheSession(t *testing.T) {
+	path := writeSessionManifest(t, `{"version": 1, "expires_after": "1ms"}`)
+	in, out, done := runHarnessCfg(t, "echo", Config{SessionManifest: path})
+
+	time.Sleep(20 * time.Millisecond) // comfortably past the 1ms grant
+	call := `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Anything","arguments":{}}}`
+	if _, err := io.WriteString(in, call+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	got := waitContains(t, out, `"c1"`)
+	if !strings.Contains(got, `"isError":true`) || !strings.Contains(got, "session_expired") {
+		t.Fatalf("expired session did not refuse with the typed code:\n%s", got)
+	}
+	drainClean(t, in, done)
+}
+
+// TestInvalidManagedPolicyPathRefusesToStart pins the fleet-operator
+// guarantee: AGENTWEAVE_MANAGED_POLICY naming an unloadable file is a hard
+// startup error, never a silent fallback to unmanaged.
+func TestInvalidManagedPolicyPathRefusesToStart(t *testing.T) {
+	t.Setenv(EnvManagedPolicy, filepath.Join(t.TempDir(), "does-not-exist.json"))
+	_, _, done := runHarnessCfg(t, "echo", Config{})
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an unreadable managed policy did not refuse to start")
+		}
+		if !strings.Contains(err.Error(), EnvManagedPolicy) {
+			t.Fatalf("the error does not name the env var the operator must fix: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return on an unreadable managed policy")
+	}
+}
+
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer

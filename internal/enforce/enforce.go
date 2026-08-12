@@ -24,7 +24,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/deploymenttheory/agentweave-harness/guardrails/audit"
+	"github.com/deploymenttheory/agentweave-harness/guardrails/manifest"
 	"github.com/deploymenttheory/agentweave-harness/guardrails/policy"
+	"github.com/deploymenttheory/agentweave-harness/wire"
 )
 
 // The decidable MCP methods — the five the policy engine reasons about.
@@ -43,11 +45,27 @@ const (
 // the in-process enforcer makes.
 const codeInvalidRequest = -32600
 
-// Decider reaches a verdict on one decidable request. Returning allow=true
-// forwards it; allow=false refuses with the given reason. It is the policy
-// engine in production and a fake in tests.
+// Decision is a decider's answer for one decidable request. Code, when set,
+// is a typed refusal code from the wire package — the machine-readable half
+// of a manifest or session-lifetime refusal. Policy-rule denials carry only a
+// reason (the signal and rule that failed explain them); the empty code keeps
+// their refusal text exactly as the in-process enforcer renders it.
+type Decision struct {
+	Allow  bool
+	Code   string
+	Reason string
+}
+
+// Allowed is the decision that forwards a request.
+func Allowed() Decision { return Decision{Allow: true} }
+
+// Refused builds a typed refusal decision.
+func Refused(code, reason string) Decision { return Decision{Code: code, Reason: reason} }
+
+// Decider reaches a verdict on one decidable request. It is the policy engine
+// (behind the manifest gate) in production and a fake in tests.
 type Decider interface {
-	Decide(ctx context.Context, method string, params json.RawMessage) (allow bool, reason string)
+	Decide(ctx context.Context, method string, params json.RawMessage) Decision
 }
 
 // DenyAll refuses every decidable request with a fixed reason. It is the
@@ -60,9 +78,17 @@ type Decider interface {
 type DenyAll struct{ Reason string }
 
 // Decide always refuses.
-func (d DenyAll) Decide(context.Context, string, json.RawMessage) (bool, string) {
-	return false, d.Reason
+func (d DenyAll) Decide(context.Context, string, json.RawMessage) Decision {
+	return Decision{Reason: d.Reason}
 }
+
+// AllowAll forwards every decidable request. It is the inner decider behind a
+// manifest gate when no policy layers are present: the manifest bounds the
+// session while the policy stack has nothing to say.
+type AllowAll struct{}
+
+// Decide always forwards.
+func (AllowAll) Decide(context.Context, string, json.RawMessage) Decision { return Allowed() }
 
 // Interceptor implements proxy.Interceptor over a Decider. It only ever refuses
 // the five decidable request methods; everything else it forwards untouched by
@@ -97,18 +123,18 @@ func (i *Interceptor) Intercept(raw []byte) []byte {
 	if !decidable(f.Method) || len(f.ID) == 0 || string(f.ID) == "null" {
 		return nil
 	}
-	allow, reason := i.decider.Decide(context.Background(), f.Method, f.Params)
-	if allow {
+	d := i.decider.Decide(context.Background(), f.Method, f.Params)
+	if d.Allow {
 		return nil
 	}
-	frame, err := refusalFrame(f.Method, f.ID, reason)
+	frame, err := refusalFrame(f.Method, f.ID, d)
 	if err != nil {
 		// A refusal we cannot serialize must still not forward: fail closed with
 		// a generic JSON-RPC error rather than letting the request through.
 		i.logger.Error("enforce: could not synthesize refusal; failing closed", "err", err)
-		return errorFrame(f.ID, "blocked by policy")
+		return errorFrame(f.ID, "blocked by policy", "")
 	}
-	i.logger.Info("enforce: refused", "method", f.Method, "reason", reason)
+	i.logger.Info("enforce: refused", "method", f.Method, "code", d.Code, "reason", d.Reason)
 	return frame
 }
 
@@ -122,10 +148,16 @@ func decidable(method string) bool {
 }
 
 // refusalFrame renders a denial for one method as a complete JSON-RPC frame.
-func refusalFrame(method string, id json.RawMessage, reason string) ([]byte, error) {
+// A typed code rides in the error's data member (the non-tool methods) or the
+// result text (tools/call, which has no data member); with no code the text
+// matches the in-process enforcer exactly.
+func refusalFrame(method string, id json.RawMessage, d Decision) ([]byte, error) {
 	msg := "blocked by device policy"
-	if reason != "" {
-		msg += ": " + reason
+	if d.Code != "" {
+		msg += " (" + d.Code + ")"
+	}
+	if d.Reason != "" {
+		msg += ": " + d.Reason
 	}
 	if method == methodCallTool {
 		// The IsError result is built from the SDK type and marshaled, so the
@@ -142,15 +174,18 @@ func refusalFrame(method string, id json.RawMessage, reason string) ([]byte, err
 			"jsonrpc": "2.0", "id": id, "result": json.RawMessage(rb),
 		})
 	}
-	return errorFrame(id, msg), nil
+	return errorFrame(id, msg, d.Code), nil
 }
 
-// errorFrame builds a JSON-RPC error response for the non-tool methods.
-func errorFrame(id json.RawMessage, msg string) []byte {
-	b, _ := marshalFrame(map[string]any{
-		"jsonrpc": "2.0", "id": id,
-		"error": map[string]any{"code": codeInvalidRequest, "message": msg},
-	})
+// errorFrame builds a JSON-RPC error response for the non-tool methods. A
+// typed code is carried as structured data alongside the message, so a client
+// can match on it without parsing prose.
+func errorFrame(id json.RawMessage, msg, code string) []byte {
+	e := map[string]any{"code": codeInvalidRequest, "message": msg}
+	if code != "" {
+		e["data"] = wire.Refusal{Code: code}
+	}
+	b, _ := marshalFrame(map[string]any{"jsonrpc": "2.0", "id": id, "error": e})
 	return b
 }
 
@@ -162,32 +197,39 @@ func marshalFrame(v map[string]any) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-// PolicyDecider adapts the policy engine to the Decider interface. It builds the
-// subject for the method from the request params — using the engine's tool
+// PolicyDecider adapts the rule-layer engines to the Decider interface. It
+// builds the subject for the method from the request params — using the tool
 // index for a tools/call, and the read-only data-egress subject for the other
-// four, matching the in-process enforcer's subjectFor — evaluates, records the
-// decision, and reports whether the call may proceed. In audit mode the engine
-// caps severity below deny, so Allowed() is true and the call forwards while the
-// intended verdict is still recorded: the harness observes without refusing,
-// exactly as a standalone server does under an audit policy.
+// four, matching the in-process enforcer's subjectFor — evaluates every layer,
+// and takes the strictest verdict (manifest.MaxVerdict): rules are never
+// merged into one attribution space, per the layering semantics. In audit
+// mode the engines cap severity below deny, so Allowed() is true and the call
+// forwards while the intended verdict is still recorded: the harness observes
+// without refusing, exactly as a standalone server does under an audit policy.
 type PolicyDecider struct {
-	engine *policy.Engine
-	audit  *audit.AuditLog
-	logger *slog.Logger
+	engines []*policy.Engine
+	audit   *audit.AuditLog
+	logger  *slog.Logger
 }
 
-// NewPolicyDecider builds the engine-backed decider.
-func NewPolicyDecider(engine *policy.Engine, a *audit.AuditLog, logger *slog.Logger) *PolicyDecider {
+// NewPolicyDecider builds the engine-backed decider over the rule layers, in
+// composition order. With no engines every request is allowed: no layers, no
+// rules.
+func NewPolicyDecider(engines []*policy.Engine, a *audit.AuditLog, logger *slog.Logger) *PolicyDecider {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &PolicyDecider{engine: engine, audit: a, logger: logger}
+	return &PolicyDecider{engines: engines, audit: a, logger: logger}
 }
 
-// Decide evaluates the request and records the verdict.
-func (d *PolicyDecider) Decide(ctx context.Context, method string, params json.RawMessage) (bool, string) {
-	subj := d.subjectFor(method, params)
-	v := d.engine.Evaluate(ctx, subj)
+// Decide evaluates the request against every layer and records the strictest
+// verdict.
+func (d *PolicyDecider) Decide(ctx context.Context, method string, params json.RawMessage) Decision {
+	if len(d.engines) == 0 {
+		return Allowed()
+	}
+	subj := subjectFor(d.engines[0], method, params)
+	v := manifest.MaxVerdict(ctx, d.engines, subj)
 	if d.audit != nil {
 		_, _ = d.audit.Append("policy.decided", map[string]any{
 			"subject":  v.Subject,
@@ -195,40 +237,59 @@ func (d *PolicyDecider) Decide(ctx context.Context, method string, params json.R
 			"intended": v.Intended.String(),
 			"mode":     string(v.Mode),
 			"rules":    v.Rules,
+			"layers":   len(d.engines),
 		})
 	}
 	if !v.Allowed() {
-		return false, v.Reason()
+		return Decision{Reason: v.Reason()}
 	}
-	return true, ""
+	return Allowed()
 }
 
-// subjectFor mirrors the in-process enforcer's subjectFor over raw params.
-func (d *PolicyDecider) subjectFor(method string, params json.RawMessage) policy.Subject {
+// subjectFor mirrors the in-process enforcer's subjectFor over raw params. The
+// engine parameter supplies the tool index; every layer engine shares the one
+// observer-built index, so any of them resolves the same facts.
+func subjectFor(engine *policy.Engine, method string, params json.RawMessage) policy.Subject {
 	switch method {
 	case methodCallTool:
-		var p struct {
-			Name string `json:"name"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return d.engine.SubjectForTool(method, p.Name)
-	case methodReadResource:
-		var p struct {
-			URI string `json:"uri"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return dataEgressSubject(method, p.URI)
-	case methodGetPrompt:
-		var p struct {
-			Name string `json:"name"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return dataEgressSubject(method, p.Name)
+		return engine.SubjectForTool(method, subjectName(method, params))
 	case methodComplete:
-		return dataEgressSubject(method, completionName(params))
-	default: // methodListen
+		return dataEgressSubject(method, clipSubject(completionName(params)))
+	case methodListen:
 		return dataEgressSubject(method, methodListen)
+	default: // methodReadResource, methodGetPrompt
+		return dataEgressSubject(method, subjectName(method, params))
 	}
+}
+
+// maxSubjectBytes bounds every caller-controlled string before it reaches a
+// Subject, the audit chain, or a manifest match — the same discipline the
+// observer applies (observe.clip) and for the same reason: the payload is the
+// client's to choose, and an unbounded one must not bloat the chain or the
+// matcher.
+const maxSubjectBytes = 256
+
+// clipSubject sanitizes a caller-controlled string pre-policy.
+func clipSubject(s string) string {
+	if len(s) <= maxSubjectBytes {
+		return s
+	}
+	return s[:maxSubjectBytes] + "…(clipped)"
+}
+
+// subjectName extracts the caller's name for the subject: params.name for
+// tools/call and prompts/get, params.uri for resources/read — clipped before
+// anything downstream sees it.
+func subjectName(method string, params json.RawMessage) string {
+	var p struct {
+		Name string `json:"name"`
+		URI  string `json:"uri"`
+	}
+	_ = json.Unmarshal(params, &p)
+	if method == methodReadResource {
+		return clipSubject(p.URI)
+	}
+	return clipSubject(p.Name)
 }
 
 // dataEgressSubject builds the read-only subject the four non-tool data-egress
