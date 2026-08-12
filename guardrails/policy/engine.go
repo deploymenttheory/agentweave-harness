@@ -2,7 +2,9 @@ package policy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +61,13 @@ type Subject struct {
 	// they are synthesized (see SubjectForMethod) so those methods cannot route
 	// around a rule that covers equivalent tools.
 	Facts ToolFacts
+	// Arguments is the call's argument context, for rule constraints. nil and
+	// empty are different statements: nil means the subject carries no
+	// argument context at all (a startup or plan-time subject) and constraints
+	// are skipped — they are spent where the arguments actually are, at call
+	// time; an empty map is a real call with no arguments, in which every
+	// constrained argument is absent and fails.
+	Arguments map[string]any
 }
 
 // String renders the subject for audit records and explain output.
@@ -120,23 +129,47 @@ func (v Verdict) Reason() string {
 
 // Engine is the policy decision point on the request path.
 type Engine struct {
-	policy *Policy
-	cache  *signalCache
-	index  ToolIndex
-	args   map[string]string
-	limits *rateLimiter
+	policy   *Policy
+	cache    *signalCache
+	index    ToolIndex
+	args     map[string]string
+	limits   *rateLimiter
+	patterns map[string]*regexp.Regexp
 }
 
 // NewEngine builds the engine. The policy must already have been validated
 // against reg, which Load does.
 func NewEngine(policy *Policy, reg *signals.Registry, index ToolIndex, env func() *signals.Env) *Engine {
 	return &Engine{
-		policy: policy,
-		cache:  newSignalCache(reg, policy, env),
-		index:  index,
-		args:   argsFrom(policy),
-		limits: newRateLimiter(policy.RateLimits),
+		policy:   policy,
+		cache:    newSignalCache(reg, policy, env),
+		index:    index,
+		args:     argsFrom(policy),
+		limits:   newRateLimiter(policy.RateLimits),
+		patterns: compilePatterns(policy),
 	}
+}
+
+// compilePatterns compiles every constraint pattern once, keyed by source.
+// Validation already refused anything that does not compile; a pattern that
+// still fails here evaluates as a violation (see constraintFailures), never a
+// pass.
+func compilePatterns(policy *Policy) map[string]*regexp.Regexp {
+	out := map[string]*regexp.Regexp{}
+	for _, r := range policy.Rules {
+		for _, c := range r.Constraints {
+			if c.Pattern == "" {
+				continue
+			}
+			if _, seen := out[c.Pattern]; seen {
+				continue
+			}
+			if re, err := regexp.Compile(c.Pattern); err == nil {
+				out[c.Pattern] = re
+			}
+		}
+	}
+	return out
 }
 
 // Policy returns the active policy.
@@ -276,6 +309,17 @@ func (e *Engine) evaluateSignals(ctx context.Context, subj Subject) Verdict {
 			}
 			attributed[id] = attribution{rule: label, severity: r.OnFail, specificity: r.specificity()}
 		}
+		// Constraints belong wholly to their own rule — no cross-rule
+		// attribution to shadow — so they are evaluated in place. A subject
+		// with no argument context (nil) skips them; see Subject.Arguments.
+		if subj.Arguments != nil && len(r.Constraints) > 0 {
+			for _, f := range e.constraintFailures(r, label, subj.Arguments) {
+				v.Failures = append(v.Failures, f)
+				if f.Severity > v.Intended {
+					v.Intended = f.Severity
+				}
+			}
+		}
 	}
 
 	// Read the signals in a stable order so the audit record is reproducible.
@@ -318,6 +362,78 @@ func (e *Engine) evaluateSignals(ctx context.Context, subj Subject) Verdict {
 	}
 
 	return v
+}
+
+// constraintFailures evaluates one matching rule's argument constraints.
+// Every detail names the argument and the bound, never the value: argument
+// values are the caller's content, and they stay out of the audit chain here
+// for the same reason tool arguments are digested, not recorded. Absent is
+// not compliant, and neither is a value of the wrong type — a constraint the
+// call can dodge by omitting or retyping the argument constrains nothing.
+func (e *Engine) constraintFailures(r Rule, label string, args map[string]any) []Failure {
+	var out []Failure
+	fail := func(detail string) {
+		out = append(out, Failure{Signal: "constraint", Rule: label, Severity: r.OnFail, Detail: detail})
+	}
+	for _, arg := range sortedKeys(r.Constraints) {
+		c := r.Constraints[arg]
+		val, present := args[arg]
+		if !present {
+			fail("argument " + arg + " is absent; constrained arguments must be present")
+			continue
+		}
+		if c.Min != nil || c.Max != nil {
+			n, ok := asNumber(val)
+			switch {
+			case !ok:
+				fail("argument " + arg + " is not a number")
+			case c.Min != nil && n < *c.Min:
+				fail(fmt.Sprintf("argument %s is below min %v", arg, *c.Min))
+			case c.Max != nil && n > *c.Max:
+				fail(fmt.Sprintf("argument %s exceeds max %v", arg, *c.Max))
+			}
+		}
+		if c.MaxLength != nil || c.Pattern != "" {
+			s, ok := val.(string)
+			if !ok {
+				fail("argument " + arg + " is not a string")
+				continue
+			}
+			if c.MaxLength != nil && len(s) > *c.MaxLength {
+				fail(fmt.Sprintf("argument %s is %d bytes, exceeding max_length %d", arg, len(s), *c.MaxLength))
+			}
+			if c.Pattern != "" {
+				re := e.patterns[c.Pattern]
+				if re == nil {
+					// Validation refuses uncompilable patterns, so this is a
+					// hand-built policy that skipped Validate. Fail closed.
+					fail("argument " + arg + ": constraint pattern did not compile")
+				} else if !re.MatchString(s) {
+					fail("argument " + arg + " does not match the required pattern")
+				}
+			}
+		}
+	}
+	return out
+}
+
+// asNumber coerces the JSON and Go numeric shapes a decoded argument can take.
+func asNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // PlanVerdict is the decision about a whole proposed plan: the worst severity any

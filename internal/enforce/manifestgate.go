@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/deploymenttheory/agentweave-harness/guardrails/audit"
@@ -58,9 +59,18 @@ func (g *ManifestGate) Decide(ctx context.Context, method string, params json.Ra
 	}
 	switch method {
 	case methodCallTool:
-		if name := subjectName(method, params); !g.session.AllowsTool(name) {
+		name := subjectName(method, params)
+		if !g.session.AllowsTool(name) {
 			return g.refused(method, name, wire.RefusalPermissionDenied,
 				"the session manifest does not grant this tool")
+		}
+		// The apps grant binds the App tool's name argument — launching an
+		// application is a resource acquisition, bounded like a read. An App
+		// call with no readable name argument is refused when a grant is
+		// present: absent is not compliant, or the grant would be dodgeable.
+		if app, isLaunch := launchedApp(name, params); isLaunch && !g.session.AllowsApp(app) {
+			return g.refused(method, app, wire.RefusalBoundedResourceOutsideManifest,
+				"the application is outside the session manifest's grant")
 		}
 	case methodReadResource:
 		if uri := subjectName(method, params); !g.session.AllowsResource(uri) {
@@ -73,6 +83,23 @@ func (g *ManifestGate) Decide(ctx context.Context, method string, params json.Ra
 		g.session.Touch(t)
 	}
 	return d
+}
+
+// launchedApp reports whether this tools/call is an application launch (the
+// App tool, matched case-insensitively) and, if so, which application its
+// name argument names — clipped like every caller string. A launch with no
+// readable name argument reports "", which no explicit grant contains.
+func launchedApp(tool string, params json.RawMessage) (string, bool) {
+	if !strings.EqualFold(tool, "App") {
+		return "", false
+	}
+	var p struct {
+		Arguments struct {
+			Name string `json:"name"`
+		} `json:"arguments"`
+	}
+	_ = json.Unmarshal(params, &p)
+	return clipSubject(p.Arguments.Name), true
 }
 
 // refused records and builds a typed manifest refusal. The subject in the

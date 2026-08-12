@@ -145,14 +145,26 @@ arguments after the match and before the verdict:
 }
 ```
 
-Per argument: `min` / `max` (numbers), `max_length` (strings), `pattern`
-(regular expression). **Patterns are RE2** — Go's `regexp` — which cannot
-backtrack, so evaluation cost is linear in the input and a policy author
-cannot write a pattern that stalls the decision path. A constraint on an
-argument the call does not carry fails the rule (absent is not compliant);
-caller-supplied strings are clipped to a fixed bound before matching and
-before auditing, so an oversized argument cannot bloat the chain or the
-matcher.
+Per argument: `min` / `max` (numbers), `max_length` (strings, in bytes),
+`pattern` (regular expression, standard unanchored matching — write `^…$` to
+anchor). **Patterns are RE2** — Go's `regexp` — which cannot backtrack, so
+evaluation cost is linear in the input (already bounded by the 256 KiB frame
+cap) and a policy author cannot write a pattern that stalls the decision
+path; a backreference does not compile, and validation refuses it
+(`TestArgumentPatternsAreRE2Bounded` pins this). A constraint on an argument
+the call does not carry fails the rule (absent is not compliant), as does a
+value of the wrong type. Two more rules keep this safe:
+
+- **A subject with no argument context skips constraints entirely.** A real
+  `tools/call` always has argument context (an omitted `arguments` object is
+  an empty set, in which every constrained argument is absent and fails);
+  plan-time and startup subjects have none, so constraints are spent where
+  the arguments actually are — at call time — rather than failing every plan
+  step that has no arguments to check.
+- **A constraint failure's detail names the argument and the bound, never the
+  value.** Argument values are the caller's content; they stay out of the
+  audit chain here for the same reason tool arguments are digested, not
+  recorded.
 
 ## What composition never does
 

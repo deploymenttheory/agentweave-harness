@@ -106,6 +106,37 @@ func TestManifestGateIdleClockOnlyRefreshesOnAllow(t *testing.T) {
 	}
 }
 
+// TestManifestGateBindsTheAppsGrant pins the argument-level half of the
+// resources grant: an App launch outside allow.resources.apps is refused with
+// the typed code, a launch with no readable name argument is refused when a
+// grant is present (absent is not compliant, or the grant would be
+// dodgeable), and other tools are untouched by the apps list.
+func TestManifestGateBindsTheAppsGrant(t *testing.T) {
+	start := time.Now()
+	c := &clock{t: start}
+	g := NewManifestGate(gateSession(t,
+		`{"version":1,"expires_after":"1h","allow":{"resources":{"apps":["notepad"]}}}`, start),
+		&fakeDecider{}, nil, nil, c.now)
+
+	if d := g.Decide(context.Background(), methodCallTool,
+		[]byte(`{"name":"App","arguments":{"name":"notepad"}}`)); !d.Allow {
+		t.Fatalf("granted app refused: %+v", d)
+	}
+	d := g.Decide(context.Background(), methodCallTool,
+		[]byte(`{"name":"app","arguments":{"name":"cmd"}}`))
+	if d.Allow || d.Code != wire.RefusalBoundedResourceOutsideManifest {
+		t.Fatalf("ungranted app: got %+v, want %s", d, wire.RefusalBoundedResourceOutsideManifest)
+	}
+	if d := g.Decide(context.Background(), methodCallTool,
+		[]byte(`{"name":"App","arguments":{}}`)); d.Allow {
+		t.Fatal("an App launch with no name argument dodged the apps grant")
+	}
+	if d := g.Decide(context.Background(), methodCallTool,
+		[]byte(`{"name":"Snapshot","arguments":{}}`)); !d.Allow {
+		t.Fatalf("the apps grant leaked onto a non-App tool: %+v", d)
+	}
+}
+
 // TestManifestGateNilSessionIsInner pins the unconditional-composition
 // contract: no manifest, no gate.
 func TestManifestGateNilSessionIsInner(t *testing.T) {

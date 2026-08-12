@@ -70,3 +70,8 @@ func (s *Session) AllowsTool(name string) bool {
 func (s *Session) AllowsResource(uri string) bool {
 	return s == nil || s.m.AllowsResource(uri)
 }
+
+// AllowsApp is the session view of Manifest.AllowsApp; nil allows.
+func (s *Session) AllowsApp(name string) bool {
+	return s == nil || s.m.AllowsApp(name)
+}

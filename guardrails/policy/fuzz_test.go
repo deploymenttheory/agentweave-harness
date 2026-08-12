@@ -33,6 +33,8 @@ func FuzzParse(f *testing.F) {
 		`{"version":1,"signals":{"x":{"ttl":"0s"}},"transparency":{"heartbeat":"5m","anchor":{"destination":"eventlog","cadence":"90s"}}}`,
 		`{"version":1,"credentials":{"acknowledge_toolset_exposure":"shell"}}`,
 		`{"version":1,"egress":{"enabled":true,"allow":["*.example.com","10.0.0.1"],"allow_ports":[443,80]}}`,
+		`{"version":1,"mode":"enforce","rules":[{"name":"c","match":{"tool":"Type"},"require":[],` +
+			`"constraints":{"text":{"max_length":4096,"pattern":"^[a-z]+$"},"count":{"min":1,"max":3}},"on_fail":"deny"}]}`,
 	} {
 		f.Add([]byte(s))
 	}
