@@ -409,6 +409,61 @@ func TestExpiredManifestDrainsTheSession(t *testing.T) {
 	drainClean(t, in, done)
 }
 
+// TestRunEnforcesArgumentConstraints pins constraints end to end: a rule
+// bounding an argument refuses the oversized call on the wire with the
+// argument named — and the value absent — in the refusal, while the compliant
+// call flows through.
+func TestRunEnforcesArgumentConstraints(t *testing.T) {
+	policyPath := filepath.Join(t.TempDir(), "policy.json")
+	policyDoc := `{
+	  "version": 1,
+	  "mode": "enforce",
+	  "signals": {},
+	  "rules": [
+	    {"name": "bounded-shell", "match": {"tool": "Shell"}, "require": [],
+	     "constraints": {"cmd": {"max_length": 8}}, "on_fail": "deny"}
+	  ]
+	}`
+	if err := os.WriteFile(policyPath, []byte(policyDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ackFile := filepath.Join(t.TempDir(), "ackmode")
+	t.Setenv(ackModeFileEnv, ackFile)
+	in, out, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
+
+	// The ack is sent only after the real decider is installed (the honest-ack
+	// ordering), so waiting for it removes the race against the fail-closed
+	// initializer — this test asserts the constraint path specifically.
+	if mode := waitAckMode(t, ackFile); mode != wire.ModeEnforce {
+		t.Fatalf("expected an enforce ack, got %q", mode)
+	}
+
+	longCmd := strings.Repeat("x", 64)
+	call := `{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"Shell","arguments":{"cmd":"` +
+		longCmd + `"}}}`
+	if _, err := io.WriteString(in, call+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	got := waitContains(t, out, `"c1"`)
+	if !strings.Contains(got, `"isError":true`) || !strings.Contains(got, "max_length") {
+		t.Fatalf("oversized argument was not refused with the bound named:\n%s", got)
+	}
+	// The client-bound stream carries only the harness's frames, so the value
+	// appearing anywhere in it means the refusal leaked the argument back.
+	if strings.Contains(got, longCmd) {
+		t.Fatal("the argument value leaked into the refusal")
+	}
+
+	ok := `{"jsonrpc":"2.0","id":"c2","method":"tools/call","params":{"name":"Shell","arguments":{"cmd":"whoami"}}}`
+	if _, err := io.WriteString(in, ok+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitContains(t, out, `"c2"`); !strings.Contains(got, `"echo":true`) {
+		t.Fatalf("compliant call did not flow through:\n%s", got)
+	}
+	drainClean(t, in, done)
+}
+
 // TestInvalidManagedPolicyPathRefusesToStart pins the fleet-operator
 // guarantee: AGENTWEAVE_MANAGED_POLICY naming an unloadable file is a hard
 // startup error, never a silent fallback to unmanaged.

@@ -249,10 +249,24 @@ func (d *PolicyDecider) Decide(ctx context.Context, method string, params json.R
 // subjectFor mirrors the in-process enforcer's subjectFor over raw params. The
 // engine parameter supplies the tool index; every layer engine shares the one
 // observer-built index, so any of them resolves the same facts.
+//
+// A tools/call always gets argument context — an omitted arguments object is
+// an empty set, in which every constrained argument is absent and fails — so
+// a caller cannot dodge a constraint by leaving the object out.
 func subjectFor(engine *policy.Engine, method string, params json.RawMessage) policy.Subject {
 	switch method {
 	case methodCallTool:
-		return engine.SubjectForTool(method, subjectName(method, params))
+		var p struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		_ = json.Unmarshal(params, &p)
+		subj := engine.SubjectForTool(method, clipSubject(p.Name))
+		if p.Arguments == nil {
+			p.Arguments = map[string]any{}
+		}
+		subj.Arguments = p.Arguments
+		return subj
 	case methodComplete:
 		return dataEgressSubject(method, clipSubject(completionName(params)))
 	case methodListen:

@@ -126,6 +126,15 @@ func (m *Manifest) AllowsTool(name string) bool {
 	return m.Allow.Tools.Contains(name)
 }
 
+// AllowsApp reports whether the manifest grants launching the application. A
+// nil Apps list does not restrict; an empty one grants nothing.
+func (m *Manifest) AllowsApp(name string) bool {
+	if m.Allow.Resources.Apps == nil {
+		return true
+	}
+	return m.Allow.Resources.Apps.Contains(name)
+}
+
 // AllowsResource reports whether a resource URI (or path) falls inside the
 // manifest's grant: under any files prefix, or targeting any allowed origin.
 // With neither list present the manifest does not restrict resources.

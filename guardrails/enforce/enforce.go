@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sort"
@@ -416,7 +417,17 @@ func subjectFor(engine *policy.Engine, method string, req mcp.Request) (policy.S
 		if !ok {
 			return policy.Subject{}, false, errMalformedParams
 		}
-		return engine.SubjectForTool(method, p.Name), true, nil
+		subj := engine.SubjectForTool(method, p.Name)
+		// A tools/call always gets argument context: an omitted or unreadable
+		// arguments object is an empty set, in which every constrained
+		// argument is absent and fails — a caller cannot dodge a constraint
+		// by leaving the object out or malforming it.
+		args := map[string]any{}
+		if len(p.Arguments) > 0 {
+			_ = json.Unmarshal(p.Arguments, &args)
+		}
+		subj.Arguments = args
+		return subj, true, nil
 
 	case methodReadResource:
 		p, ok := req.GetParams().(*mcp.ReadResourceParams)

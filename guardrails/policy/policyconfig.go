@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -143,6 +144,7 @@ var (
 	ErrUndeclaredSignal   = errors.New("rule requires a signal that is not declared")
 	ErrEmptyMatch         = errors.New("rule matches nothing")
 	ErrInvalidRateLimit   = errors.New("invalid rate limit")
+	ErrInvalidConstraint  = errors.New("invalid argument constraint")
 	ErrInvalidEgress      = errors.New("invalid egress policy")
 	ErrInvalidAnchor      = errors.New("invalid anchor policy")
 	ErrInvalidCredentials = errors.New("invalid credentials policy")
@@ -381,7 +383,34 @@ type Rule struct {
 	Name    string   `json:"name,omitempty"`
 	Match   Match    `json:"match"`
 	Require []string `json:"require"`
-	OnFail  Severity `json:"on_fail"`
+	// Constraints bound the arguments of a matching call, keyed by argument
+	// name. A violated constraint fails the rule at OnFail, like a failing
+	// required signal; a rule may carry constraints with an empty require.
+	// Semantics are ratified in docs/policy-config.md: absent is not
+	// compliant, wrong type is not compliant, details never carry the value.
+	Constraints map[string]Constraint `json:"constraints,omitempty"`
+	OnFail      Severity              `json:"on_fail"`
+}
+
+// Constraint bounds one argument of a matching call. At least one bound must
+// be set — a constraint that constrains nothing is refused at validation.
+type Constraint struct {
+	// Min/Max bound a numeric argument, inclusive.
+	Min *float64 `json:"min,omitempty"`
+	Max *float64 `json:"max,omitempty"`
+	// MaxLength bounds a string argument's length in bytes.
+	MaxLength *int `json:"max_length,omitempty"`
+	// Pattern is an RE2 regular expression the string argument must match
+	// (standard unanchored matching — write ^…$ to anchor). RE2 cannot
+	// backtrack, so evaluation is linear in the input and a policy author
+	// cannot write a pattern that stalls the decision path; a backreference
+	// does not compile and validation refuses it.
+	Pattern string `json:"pattern,omitempty"`
+}
+
+// empty reports a constraint with no bounds set.
+func (c Constraint) empty() bool {
+	return c.Min == nil && c.Max == nil && c.MaxLength == nil && c.Pattern == ""
 }
 
 // scope returns the rule's scope, defaulting to call.
@@ -789,8 +818,8 @@ func (p *Policy) Validate(known []string) error {
 		if r.scope() == ScopeCall && r.specificity() == 0 && !r.Match.Toolset.Contains("*") {
 			add("%v: %s selects no requests; use toolset \"*\" to mean every tool", ErrEmptyMatch, label)
 		}
-		if len(r.Require) == 0 {
-			add("%s: requires no signals, so it can never fail", label)
+		if len(r.Require) == 0 && len(r.Constraints) == 0 {
+			add("%s: requires no signals and constrains no arguments, so it can never fail", label)
 		}
 		// A startup admission is a one-shot go/no-go with no request to suspend and
 		// no session yet to solicit a decision from, so hold has no meaning there.
@@ -801,6 +830,33 @@ func (p *Policy) Validate(known []string) error {
 		for _, id := range r.Require {
 			if _, declared := p.Signals[id]; !declared {
 				add("%v: %s requires %q, which is not declared in signals", ErrUndeclaredSignal, label, id)
+			}
+		}
+		// Constraints evaluate against a call's arguments; a startup subject has
+		// none, so a startup rule carrying them is dead configuration — refused,
+		// like every control believed in force and silently absent.
+		if len(r.Constraints) > 0 && r.scope() == ScopeStartup {
+			add("%v: %s puts argument constraints on a startup rule; startup subjects carry no arguments",
+				ErrInvalidConstraint, label)
+		}
+		for _, arg := range sortedKeys(r.Constraints) {
+			c := r.Constraints[arg]
+			if c.empty() {
+				add("%v: %s constraint on %q constrains nothing; set min, max, max_length or pattern",
+					ErrInvalidConstraint, label, arg)
+			}
+			if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
+				add("%v: %s constraint on %q has min > max", ErrInvalidConstraint, label, arg)
+			}
+			if c.MaxLength != nil && *c.MaxLength < 0 {
+				add("%v: %s constraint on %q has a negative max_length", ErrInvalidConstraint, label, arg)
+			}
+			if c.Pattern != "" {
+				if _, err := regexp.Compile(c.Pattern); err != nil {
+					add("%v: %s constraint on %q: pattern does not compile as RE2 "+
+						"(backreferences and lookarounds are deliberately unsupported, "+
+						"so evaluation stays linear): %v", ErrInvalidConstraint, label, arg, err)
+				}
 			}
 		}
 	}
