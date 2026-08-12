@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -85,22 +87,33 @@ func fakeSignalServant() {
 // ackModeFileEnv names a file the fake servant writes the hello.ack's mode
 // into, so a test can assert which mode the harness actually told its server —
 // the wire fact the shedding contract rests on — without touching the MCP
-// stream.
-const ackModeFileEnv = "AW_ACK_MODE_FILE"
+// stream. ackJSONFileEnv records the whole ack, for tests asserting on the
+// effective config (the announced egress port).
+const (
+	ackModeFileEnv = "AW_ACK_MODE_FILE"
+	ackJSONFileEnv = "AW_ACK_JSON_FILE"
+)
 
-// reportAckMode writes the ack's mode to the file named by ackModeFileEnv, if
-// the driving test asked for it.
+// reportAckMode writes the ack's mode (and, when asked, the whole ack) to the
+// files the driving test named.
 func reportAckMode(ack wire.Envelope) {
-	path := os.Getenv(ackModeFileEnv)
-	if path == "" {
-		return
-	}
 	var ha wire.HelloAck
 	if err := wire.Unmarshal(ack, &ha); err != nil {
 		os.Exit(5)
 	}
-	if err := os.WriteFile(path, []byte(ha.Mode), 0o600); err != nil {
-		os.Exit(5)
+	if path := os.Getenv(ackModeFileEnv); path != "" {
+		if err := os.WriteFile(path, []byte(ha.Mode), 0o600); err != nil {
+			os.Exit(5)
+		}
+	}
+	if path := os.Getenv(ackJSONFileEnv); path != "" {
+		b, err := json.Marshal(ha)
+		if err != nil {
+			os.Exit(5)
+		}
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			os.Exit(5)
+		}
 	}
 }
 
@@ -462,6 +475,101 @@ func TestRunEnforcesArgumentConstraints(t *testing.T) {
 		t.Fatalf("compliant call did not flow through:\n%s", got)
 	}
 	drainClean(t, in, done)
+}
+
+// TestHarnessRunsEgressProxyAndAnnouncesPort pins the Phase-6 relocation: an
+// egress-enabled composed policy starts the loopback proxy in the harness
+// process, and the bound port reaches the servant in the hello.ack's
+// effective config, where the host's OS enforcement will point at it.
+func TestHarnessRunsEgressProxyAndAnnouncesPort(t *testing.T) {
+	policyPath := filepath.Join(t.TempDir(), "policy.json")
+	policyDoc := `{
+	  "version": 1,
+	  "egress": {"enabled": true, "listen": "127.0.0.1:0", "allow": ["api.example.com"]}
+	}`
+	if err := os.WriteFile(policyPath, []byte(policyDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ackFile := filepath.Join(t.TempDir(), "ack.json")
+	t.Setenv(ackJSONFileEnv, ackFile)
+	in, _, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
+
+	deadline := time.Now().Add(10 * time.Second)
+	var ha wire.HelloAck
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(ackFile); err == nil && len(b) > 0 {
+			if err := json.Unmarshal(b, &ha); err != nil {
+				t.Fatalf("undecodable ack record: %v", err)
+			}
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ha.EffectiveConfig.EgressProxyPort == 0 {
+		t.Fatal("the ack announced no egress proxy port")
+	}
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(context.Background(), "tcp",
+		"127.0.0.1:"+strconv.Itoa(ha.EffectiveConfig.EgressProxyPort))
+	if err != nil {
+		t.Fatalf("the announced port is not listening: %v", err)
+	}
+	_ = conn.Close()
+	drainClean(t, in, done)
+}
+
+// TestElevationGateRefusesWeakerPosture pins the handshake gate: a composed
+// egress policy naming applications needs OS enforcement, which needs
+// elevation this servant does not advertise — the session is refused rather
+// than served with a weaker posture than the documents describe.
+func TestElevationGateRefusesWeakerPosture(t *testing.T) {
+	policyPath := filepath.Join(t.TempDir(), "policy.json")
+	policyDoc := `{
+	  "version": 1,
+	  "egress": {"enabled": true, "listen": "127.0.0.1:0", "allow": ["api.example.com"],
+	             "applications": ["C:\\\\Tools\\\\agent.exe"]}
+	}`
+	if err := os.WriteFile(policyPath, []byte(policyDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, done := runHarnessCfg(t, "signal-servant", Config{PolicyConfig: policyPath})
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "elevation") {
+			t.Fatalf("non-elevated servant was served an elevation-needing posture: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not refuse the session")
+	}
+}
+
+// TestEmptyEgressIntersectionRefusesToStart pins the compose-then-serve
+// boundary: layers whose allowlists intersect to nothing refuse at startup —
+// the operator learns the layers are incompatible, instead of getting a proxy
+// that refuses every request and reads as a broken network.
+func TestEmptyEgressIntersectionRefusesToStart(t *testing.T) {
+	dir := t.TempDir()
+	managed := filepath.Join(dir, "managed.json")
+	user := filepath.Join(dir, "user.json")
+	if err := os.WriteFile(managed, []byte(
+		`{"version": 1, "egress": {"enabled": true, "allow": ["a.example.com"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(user, []byte(
+		`{"version": 1, "egress": {"enabled": true, "listen": "127.0.0.1:0", "allow": ["b.example.net"]}}`,
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvManagedPolicy, managed)
+	_, _, done := runHarnessCfg(t, "echo", Config{PolicyConfig: user})
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "allowlist") {
+			t.Fatalf("an empty egress intersection started a session: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not refuse the empty intersection")
+	}
 }
 
 // TestInvalidManagedPolicyPathRefusesToStart pins the fleet-operator
