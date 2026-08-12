@@ -339,6 +339,11 @@ func TestToolInjectionAppendsToTheClientsManifest(t *testing.T) {
 		`{"jsonrpc":"2.0","id":"t1","method":"tools/list"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
+	// Wait until the request has been forwarded to the server before the server
+	// answers: in production the request always passes through the proxy (and
+	// is noted for injection) before the server can reply, so replying earlier
+	// is a race only this in-memory rig could create.
+	r.waitFor(t, r.serverInbox, `"tools/list"`)
 	// Server answers with one tool.
 	if _, err := io.WriteString(r.serverReply,
 		`{"jsonrpc":"2.0","id":"t1","result":{"tools":[{"name":"Snapshot"}]}}`+"\n"); err != nil {
