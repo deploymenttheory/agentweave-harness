@@ -46,6 +46,12 @@ control channel land in later phases. First governed server:
 | [docs/scope.md](docs/scope.md) | What this harness does **not** do, and what it never records |
 | [docs/roadmap.md](docs/roadmap.md) | Deferred ideas and their provenance |
 
+## Releases
+
+Merges to `main` run release-please. Conventional `fix:` and `feat:` commits
+open a release PR; merge that PR to create the version tag and GitHub release.
+The workflow can also be started manually from GitHub Actions.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
