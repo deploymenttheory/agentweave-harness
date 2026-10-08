@@ -116,7 +116,7 @@ func (winActuator) Shutdown(reason string, delay time.Duration) error {
 	}
 	secs := shutdownSeconds(delay)
 	msg := "Windows MCP security kill switch: " + reason
-	return shutdown.InitiateSystemShutdownEx("", msg, secs, true /*force*/, false, /*reboot*/
+	return shutdown.InitiateSystemShutdownEx(nil, &msg, secs, true /*force*/, false, /*reboot*/
 		shutdown.SHTDN_REASON_MAJOR_OTHER|shutdown.SHTDN_REASON_MINOR_OTHER|shutdown.SHTDN_REASON_FLAG_PLANNED)
 }
 
@@ -130,7 +130,7 @@ func enableShutdownPrivilege() error {
 	defer func() { _ = foundation.CloseHandle(tok) }() // best-effort cleanup
 
 	var luid foundation.LUID
-	if err := security.LookupPrivilegeValue("", security.SE_SHUTDOWN_NAME, &luid); err != nil {
+	if err := security.LookupPrivilegeValue(nil, security.SE_SHUTDOWN_NAME, &luid); err != nil {
 		return err
 	}
 	tp := security.TOKEN_PRIVILEGES{PrivilegeCount: 1}

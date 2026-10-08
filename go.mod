@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/deploymenttheory/go-bindings-win32 v0.2.1
+	github.com/deploymenttheory/go-bindings-win32 v0.5.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/spf13/cobra v1.10.2
 	go.opentelemetry.io/otel v1.44.0
