@@ -184,7 +184,7 @@ func addProxyAllowRule(rules *windowsfirewall.INetFwRules, exePath, ports string
 // setRuleEnabled flips a rule on or off by name, for the kill-path suspend that
 // must weaken egress without restoring the machine's default actions.
 func setRuleEnabled(rules *windowsfirewall.INetFwRules, name string, enabled bool) error {
-	b := foundation.SysAllocString(name)
+	b := foundation.SysAllocString(&name)
 	defer foundation.SysFreeString(b)
 	rule, err := rules.Item(b)
 	if err != nil || rule == nil {

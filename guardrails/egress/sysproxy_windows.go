@@ -45,7 +45,8 @@ func regErr(op string, code foundation.WIN32_ERROR) error {
 // openInternetSettings opens this user's WinINET key. The caller closes it.
 func openInternetSettings(access registry.REG_SAM_FLAGS) (registry.HKEY, func(), error) {
 	var key registry.HKEY
-	code := registry.RegOpenKeyEx(registry.HKEY_CURRENT_USER, internetSettingsKey, 0, access, &key)
+	subKey := internetSettingsKey
+	code := registry.RegOpenKeyEx(registry.HKEY_CURRENT_USER, &subKey, 0, access, &key)
 	if err := regErr("open "+internetSettingsKey, code); err != nil {
 		return 0, nil, err
 	}
@@ -56,14 +57,14 @@ func openInternetSettings(access registry.REG_SAM_FLAGS) (registry.HKEY, func(),
 func queryString(key registry.HKEY, name string) (string, bool) {
 	var valueType registry.REG_VALUE_TYPE
 	var size uint32
-	if code := registry.RegQueryValueEx(key, name, &valueType, nil, &size); code != foundation.ERROR_SUCCESS {
+	if code := registry.RegQueryValueEx(key, &name, &valueType, nil, &size); code != foundation.ERROR_SUCCESS {
 		return "", false
 	}
 	if size == 0 {
 		return "", true
 	}
 	buf := make([]byte, size)
-	if code := registry.RegQueryValueEx(key, name, &valueType, &buf[0], &size); code != foundation.ERROR_SUCCESS {
+	if code := registry.RegQueryValueEx(key, &name, &valueType, &buf[0], &size); code != foundation.ERROR_SUCCESS {
 		return "", false
 	}
 	// The value comes back as UTF-16 including its terminator.
@@ -75,7 +76,7 @@ func queryDWord(key registry.HKEY, name string) (uint32, bool) {
 	var valueType registry.REG_VALUE_TYPE
 	size := uint32(4)
 	buf := make([]byte, 4)
-	if code := registry.RegQueryValueEx(key, name, &valueType, &buf[0], &size); code != foundation.ERROR_SUCCESS {
+	if code := registry.RegQueryValueEx(key, &name, &valueType, &buf[0], &size); code != foundation.ERROR_SUCCESS {
 		return 0, false
 	}
 	return binary.LittleEndian.Uint32(buf), true
@@ -89,19 +90,19 @@ func setString(key registry.HKEY, name, value string) error {
 	for i, u := range units {
 		binary.LittleEndian.PutUint16(buf[i*2:], u)
 	}
-	return regErr("set "+name, registry.RegSetValueEx(key, name, registry.REG_SZ, buf))
+	return regErr("set "+name, registry.RegSetValueEx(key, &name, registry.REG_SZ, buf))
 }
 
 func setDWord(key registry.HKEY, name string, value uint32) error {
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, value)
-	return regErr("set "+name, registry.RegSetValueEx(key, name, registry.REG_DWORD, buf))
+	return regErr("set "+name, registry.RegSetValueEx(key, &name, registry.REG_DWORD, buf))
 }
 
 // deleteValue removes a value, treating "it was not there" as success — this
 // runs on restore paths where the value's absence is the desired end state.
 func deleteValue(key registry.HKEY, name string) error {
-	code := registry.RegDeleteValue(key, name)
+	code := registry.RegDeleteValue(key, &name)
 	if code == foundation.ERROR_SUCCESS || code == foundation.ERROR_FILE_NOT_FOUND {
 		return nil
 	}

@@ -583,7 +583,7 @@ var errNilRuleInterface = errors.New("CoCreateInstance(NetFwRule) returned a nil
 // property crosses the COM boundary this way, and forgetting the free is a leak
 // that only shows up under a long-running session.
 func withBSTR(value string, set func(foundation.BSTR) error) error {
-	b := foundation.SysAllocString(value)
+	b := foundation.SysAllocString(&value)
 	defer foundation.SysFreeString(b)
 	return set(b)
 }
@@ -594,7 +594,7 @@ func withBSTR(value string, set func(foundation.BSTR) error) error {
 // a kill, where refusing to continue because one rule had already gone would
 // leave the rest of them installed.
 func removeRule(rules *windowsfirewall.INetFwRules, name string) {
-	b := foundation.SysAllocString(name)
+	b := foundation.SysAllocString(&name)
 	defer foundation.SysFreeString(b)
 	_ = rules.Remove(b)
 }
@@ -602,7 +602,7 @@ func removeRule(rules *windowsfirewall.INetFwRules, name string) {
 // ruleExists reports whether a rule of that name is present, so recovery only
 // reports what it actually removed.
 func ruleExists(rules *windowsfirewall.INetFwRules, name string) bool {
-	b := foundation.SysAllocString(name)
+	b := foundation.SysAllocString(&name)
 	defer foundation.SysFreeString(b)
 	rule, err := rules.Item(b)
 	if err != nil || rule == nil {
