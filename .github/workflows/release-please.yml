@@ -34,5 +34,4 @@ jobs:
       - name: Release Please
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          release-type: go
           token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_PAT || github.token }}
